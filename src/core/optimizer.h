@@ -52,6 +52,7 @@ struct OptParams {
 class GradientOptimizer {
 public:
     GradientOptimizer(const OptimizerConfig& config);
+    ~GradientOptimizer();
 
     // Main entry: returns optimized shapes
     std::vector<Shape> optimize(
@@ -63,9 +64,11 @@ public:
         const cv::Mat& posterized,
         const std::vector<std::tuple<int,int,int>>& palette,
         const cv::Mat& grad_dir,
-        const Color& bg_color = {0, 0, 0, 255});
+        const Color& bg_color = {0, 0, 0, 255},
+        const cv::Mat& target_alpha = {});
 
     void request_stop() { stop_requested_ = true; }
+    void set_stop_flag(const std::atomic<bool>* flag) { external_stop_ = flag; }
 
     // Progress callback
     using ProgressCallback = std::function<void(float progress, float mse, int iter)>;
@@ -83,6 +86,8 @@ private:
 
     // Optimization loop
     void gradient_optimize();
+    void capture_best(float mse);
+    bool should_stop() const { return stop_requested_ || (external_stop_ && external_stop_->load()); }
     float run_single_iter(OptParams& params,
                           std::vector<float>& grads, int iter, int total_iters,
                           float* d_grad_history = nullptr, int write_idx = 0,
@@ -112,6 +117,7 @@ private:
     float scale_ = 1.0f;
     int H_opt_ = 0, W_opt_ = 0;
     cv::Mat target_small_, mask_small_;
+    cv::Mat loss_target_small_;
     cv::Mat saliency_small_, rgb_loss_weights_;
 
     // Renderer
@@ -121,6 +127,7 @@ private:
     OptParams params_;
     int adam_step_ = 0;
     std::atomic<bool> stop_requested_{false};
+    const std::atomic<bool>* external_stop_ = nullptr;
     ProgressCallback progress_cb_;
 
     // Async visualization pipeline (matching Python v5)
@@ -135,14 +142,11 @@ private:
     int reloc_total_ = 0;
     bool reloc_converged_ = false;
 
-    // Best-MSE cycle snapshot tracking
+    // Best evaluated parameter state (captured before the corresponding Adam update)
     float best_mse_ = 1e20f;
     bool has_best_ = false;
-    std::vector<float> best_params_flat_;
     float* snap_pinned_ = nullptr;
     cudaEvent_t snap_event_ = nullptr;
-    float cycle_mse_ = 0.0f;
-    bool snap_pending_ = false;
 
     // Background color for canvas rendering
     Color bg_color_{0, 0, 0, 255};

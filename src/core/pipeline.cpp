@@ -3,87 +3,62 @@
 #include "common/canvas.h"
 #include "common/path_utils.h"
 #include "preprocess/preprocessor.h"
+#include "preprocess/image_input.h"
 #include "core/optimizer.h"
 #include "output/json_writer.h"
-
-#include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
-
-#include <algorithm>
+#include <chrono>
 
 namespace vinylizer {
-
-static cv::Mat imread_utf8(const std::string& path, int flags = cv::IMREAD_UNCHANGED) {
-    auto buf = read_file_bytes(path);
-    if (buf.empty()) return {};
-    return cv::imdecode(buf, flags);
-}
-
-static bool imwrite_utf8(const std::string& path, const cv::Mat& img,
-                          const std::vector<int>& params = {}) {
-    std::vector<uint8_t> buf;
-    std::string ext = path.substr(path.rfind('.'));
-    if (!cv::imencode(ext, img, buf, params)) return false;
-    return write_file_bytes(path, buf.data(), buf.size());
-}
-
-void run_pipeline(const PipelineConfig& config) {
-    VIN_INFO("=== Vinylizer Pipeline ===");
-    VIN_INFO("Input: %s", config.input_path.c_str());
-
-    cv::Mat input = imread_utf8(config.input_path);
-    if (input.empty()) {
-        VIN_ERROR("Failed to load image: %s", config.input_path.c_str());
-        return;
-    }
-    VIN_INFO("Image loaded: %dx%d, channels=%d", input.cols, input.rows, input.channels());
-
+void run_pipeline(const PipelineConfig& config, const PipelineCallbacks& callbacks, bool write_preview) {
+    validate_pipeline_config(config);
+    auto bytes = read_file_bytes(config.input_path);
+    if (bytes.empty()) throw std::runtime_error("Cannot read input image: " + config.input_path);
+    cv::Mat input = normalize_input_image(cv::imdecode(bytes, cv::IMREAD_UNCHANGED));
+    const int W = input.cols, H = input.rows;
+    cv::Mat small = resize_input_image(input, std::max(config.canvas_w, config.canvas_h));
     Preprocessor preprocessor;
-    auto prep_result = preprocessor.process(input);
-
-    cv::Mat target_rgb;
-    if (input.channels() == 4) {
-        cv::cvtColor(input, target_rgb, cv::COLOR_BGRA2RGB);
-    } else if (input.channels() == 3) {
-        cv::cvtColor(input, target_rgb, cv::COLOR_BGR2RGB);
-    } else {
-        cv::cvtColor(input, target_rgb, cv::COLOR_GRAY2RGB);
+    auto prep = preprocessor.process(small);
+    auto [r, g, b] = compute_bg_color_from_result(prep.posterized, prep.opaque_mask, prep.palette, prep.rgb_image);
+    OptimizerConfig opt;
+    opt.max_shapes = config.num_shapes;
+    opt.opt_resolution = std::max(small.cols, small.rows);
+    opt.total_iters = config.num_cycles * 200;
+    opt.lr_start = config.lr_start;
+    opt.lr_end = config.lr_end;
+    GradientOptimizer optimizer(opt);
+    optimizer.set_stop_flag(callbacks.stop);
+    auto last_frame = std::chrono::steady_clock::now();
+    optimizer.set_progress_callback([&](float progress, float mse, int iter) {
+        if (callbacks.progress) callbacks.progress(progress, mse, iter);
+        auto now = std::chrono::steady_clock::now();
+        if (callbacks.frame && now - last_frame >= std::chrono::milliseconds(100)) {
+            cv::Mat frame = optimizer.get_canvas();
+            if (!frame.empty()) callbacks.frame(frame);
+            last_frame = now;
+        }
+    });
+    auto shapes = optimizer.optimize(prep.rgb_image, prep.opaque_mask, prep.edge_map,
+        prep.saliency_map, prep.dark_mask, prep.posterized, prep.palette, prep.grad_dir,
+        Color(r, g, b, 255), prep.alpha_mask);
+    if (shapes.size() != static_cast<size_t>(config.num_shapes))
+        throw std::runtime_error("Optimizer returned an unexpected number of shapes");
+    const float sx = static_cast<float>(W) / small.cols;
+    const float sy = static_cast<float>(H) / small.rows;
+    for (auto& shape : shapes) {
+        shape.cx *= sx; shape.cy *= sy; shape.rx *= sx; shape.ry *= sy;
     }
-
-    int img_w = target_rgb.cols, img_h = target_rgb.rows;
-
-    auto [bg_r, bg_g, bg_b] = compute_bg_color_from_result(
-        prep_result.posterized, prep_result.opaque_mask,
-        prep_result.palette, prep_result.rgb_image);
-    VIN_INFO("Background color: (%d, %d, %d)", bg_r, bg_g, bg_b);
-
-    OptimizerConfig opt_config;
-    opt_config.max_shapes = config.num_shapes;
-    opt_config.opt_resolution = std::max({config.canvas_w, config.canvas_h, img_w, img_h});
-    opt_config.total_iters = config.num_cycles * 200;
-    opt_config.lr_start = config.lr_start;
-    opt_config.lr_end = config.lr_end;
-
-    GradientOptimizer optimizer(opt_config);
-
-    auto shapes = optimizer.optimize(
-        target_rgb, prep_result.opaque_mask,
-        prep_result.edge_map, prep_result.saliency_map,
-        prep_result.dark_mask, prep_result.posterized,
-        prep_result.palette, prep_result.grad_dir,
-        Color(bg_r, bg_g, bg_b, 255));
-
-    VIN_INFO("Optimization produced %d shapes", static_cast<int>(shapes.size()));
-
-    write_json(config.output_path, shapes, img_w, img_h);
-
-    Canvas canvas(img_w, img_h);
-    canvas.add_shapes(shapes);
-    std::string preview_path = config.output_path + ".preview.png";
-    imwrite_utf8(preview_path, canvas.clone_image());
-    VIN_INFO("Preview saved: %s", preview_path.c_str());
-
-    VIN_INFO("=== Pipeline Complete ===");
+    write_json(config.output_path, shapes, W, H);
+    if (write_preview) {
+        Canvas canvas(W, H);
+        canvas.add_shapes(shapes);
+        // Canvas uses RGB; OpenCV image codecs expect BGR.
+        cv::Mat bgr;
+        cv::cvtColor(canvas.clone_image(), bgr, cv::COLOR_RGB2BGR);
+        std::vector<uint8_t> encoded;
+        if (!cv::imencode(".png", bgr, encoded)
+            || !write_file_bytes(config.output_path + ".preview.png", encoded.data(), encoded.size()))
+            throw std::runtime_error("Cannot save preview image");
+    }
 }
-
 } // namespace vinylizer

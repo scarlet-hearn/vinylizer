@@ -97,7 +97,7 @@ struct RenderScratch {
     // RGB loss importance [total_pixels], normalized over opaque pixels
     float* d_rgb_weights = nullptr;
 
-    // Target alpha [total_pixels] (255.0f for opaque, 0.0f for transparent)
+    // Target alpha [total_pixels], continuous [0, 255]
     float* d_target_alpha = nullptr;
 
     // Rendered alpha [total_pixels] (output from forward pass, 0-255)

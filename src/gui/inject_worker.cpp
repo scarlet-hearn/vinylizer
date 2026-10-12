@@ -21,7 +21,12 @@ void InjectWorker::run() {
     }
     emit log_message(QString("JSON validated: %1 shapes").arg(shapes.size()), false);
 
-    int layer_count = config_.layer_count > 0 ? config_.layer_count : static_cast<int>(shapes.size());
+    int layer_count = config_.layer_count;
+    if (!valid_layer_count(layer_count, shapes.size())) {
+        emit log_message(QString::fromUtf8("占位图层数必须与 JSON 图形数完全一致，且在 1–65535 之间"), true);
+        emit done(false);
+        return;
+    }
 
     // 2. Find FH6 process
     emit log_message(QString::fromUtf8("正在查找 FH6 进程..."), false);
@@ -58,7 +63,8 @@ void InjectWorker::run() {
 
     // 3. Locate layer table
     emit log_message(QString::fromUtf8("正在定位 layer table（可能需要一些时间）..."), false);
-    uint64_t table_address = locate_layer_table(pid, layer_count);
+    uint64_t group_address = 0;
+    uint64_t table_address = locate_layer_table(pid, layer_count, &group_address);
     if (table_address == 0) {
         emit log_message(QString::fromUtf8("Layer table 定位失败"), true);
         CloseHandle(h);
@@ -69,11 +75,23 @@ void InjectWorker::run() {
 
     // 4. Statistics and sampling for user confirmation
     auto stats = count_valid_layers(pid, table_address, layer_count);
+    if (stats.total_valid != layer_count) {
+        emit log_message(QString::fromUtf8("存在无效占位图层，已取消导入"), true);
+        CloseHandle(h);
+        emit done(false);
+        return;
+    }
     emit log_message(QString::fromUtf8("层表统计: 总共 %1 个有效图层, 椭圆(102): %2 个, 矩形(101): %3 个")
                          .arg(stats.total_valid).arg(stats.count_102).arg(stats.count_101), false);
 
     emit log_message(QString::fromUtf8("随机采样 6 个图层:"), false);
     auto samples = sample_layers(pid, table_address, layer_count, 6);
+    if (samples.size() != static_cast<size_t>(std::min(layer_count, 6))) {
+        emit log_message(QString::fromUtf8("图层采样读取失败，已取消导入"), true);
+        CloseHandle(h);
+        emit done(false);
+        return;
+    }
     for (const auto& s : samples) {
         const char* shape_name = (s.shape_id == 102) ? "ELLIPSE" : (s.shape_id == 101) ? "RECT" : "OTHER";
         emit log_message(QString("  层[%1]  pos=(%2, %3)  scale=(%4, %5)  rot=%6  rgba=(%7,%8,%9,%10)  shape=%11(%12)  mask=%13")
@@ -87,7 +105,6 @@ void InjectWorker::run() {
     }
 
     emit log_message(QString::fromUtf8("即将导入 %1 个 shape 到 %2 层模板中").arg(shapes.size()).arg(layer_count), false);
-    emit log_message(QString::fromUtf8("多余的 %1 层将被清零").arg(layer_count - static_cast<int>(shapes.size())), false);
     emit log_message(QString::fromUtf8("请确认以上图层信息是否为您在 FH6 中创建的占位图形"), false);
     emit log_message(QString::fromUtf8("输入 Y 确认导入，输入其他内容取消"), false);
 
@@ -96,7 +113,8 @@ void InjectWorker::run() {
     // Wait for confirmation
     {
         QMutexLocker locker(&mutex_);
-        wait_cond_.wait(&mutex_, 30000); // 30s timeout
+        if (!confirmed_ && !cancelled_)
+            wait_cond_.wait(&mutex_, 30000); // Avoid losing a confirmation before wait.
         if (cancelled_ || !confirmed_) {
             if (!cancelled_) {
                 cancelled_ = true;
@@ -109,16 +127,18 @@ void InjectWorker::run() {
 
     // 5. Write shapes (reuse handle for all layers)
     emit log_message(QString::fromUtf8("开始写入..."), false);
+    if (!layer_table_matches_h(h, group_address, table_address, layer_count)
+        || !validate_layer_table_h(h, table_address, layer_count)) {
+        emit log_message(QString::fromUtf8("图层表已变化或校验失败，已取消导入"), true);
+        CloseHandle(h);
+        emit done(false);
+        return;
+    }
     int success = 0, fail = 0;
-    int write_count = std::min(static_cast<int>(shapes.size()), layer_count);
 
     for (int i = 0; i < layer_count; ++i) {
-        bool ok;
-        if (i < write_count) {
-            ok = write_layer_h(h, table_address, i, shapes[i]);
-        } else {
-            ok = write_clear_layer_h(h, table_address, i);
-        }
+        bool ok = layer_table_matches_h(h, group_address, table_address, layer_count)
+            && write_layer_h(h, table_address, i, shapes[i]);
         if (ok) success++; else fail++;
 
         // Progress every 100 layers
@@ -126,8 +146,8 @@ void InjectWorker::run() {
             emit log_message(QString("写入进度: %1 / %2").arg(i + 1).arg(layer_count), false);
         }
 
-        if (fail >= 10 && success == 0) {
-            emit log_message(QString::fromUtf8("写入失败过多，中止"), true);
+        if (fail > 0) {
+            emit log_message(QString::fromUtf8("写入失败，中止；此前已写入 %1 层").arg(success), true);
             CloseHandle(h);
             emit done(false);
             return;

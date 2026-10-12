@@ -110,6 +110,9 @@ private:
     bool stop_btn_hovered_ = false;
     bool opt_running_ = false;
     bool opt_stopping_ = false;
+    bool opt_success_ = false;
+    bool opt_stopped_ = false;
+    QString opt_error_;
     bool done_btn_hovered_ = false;
 
     // ── Inject page ──
@@ -188,7 +191,7 @@ private slots:
     void on_anim_tick();
     void on_opt_progress(float pct, float mse, int iter);
     void on_opt_frame(QImage frame);
-    void on_opt_finished();
+    void on_opt_finished(bool success, bool stopped, QString error);
     void on_opt_preview_ready();
     void on_inject_log(QString msg, bool is_error);
     void on_inject_confirm_requested();

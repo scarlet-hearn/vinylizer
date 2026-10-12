@@ -1,5 +1,7 @@
 #include "core/optimizer.h"
 #include "core/saliency_weights.h"
+#include "core/alpha_target.h"
+#include "cuda/check.h"
 #include "common/logger.h"
 #include "common/canvas.h"
 
@@ -45,12 +47,22 @@ void OptParams::set_shape(int i, const ShapeParams& sp) {
 GradientOptimizer::GradientOptimizer(const OptimizerConfig& config)
     : config_(config) {}
 
+GradientOptimizer::~GradientOptimizer() {
+    // Synchronize before releasing memory referenced by async copies, including on exceptions.
+    try { renderer_.sync_stream(); } catch (...) {}
+    if (d_grad_history_) cudaFree(d_grad_history_);
+    if (viz_pinned_) cudaFreeHost(viz_pinned_);
+    if (snap_pinned_) cudaFreeHost(snap_pinned_);
+    if (viz_event_) cudaEventDestroy(viz_event_);
+    if (snap_event_) cudaEventDestroy(snap_event_);
+}
+
 std::vector<Shape> GradientOptimizer::optimize(
     const cv::Mat& target_rgb, const cv::Mat& mask,
     const cv::Mat& edge_map, const cv::Mat& saliency_map,
     const cv::Mat& dark_mask, const cv::Mat& posterized,
     const std::vector<std::tuple<int,int,int>>& palette,
-    const cv::Mat& grad_dir, const Color& bg_color)
+    const cv::Mat& grad_dir, const Color& bg_color, const cv::Mat& target_alpha)
 {
     target_rgb_ = target_rgb.clone();
     mask_ = mask.clone();
@@ -64,8 +76,8 @@ std::vector<Shape> GradientOptimizer::optimize(
     int H_orig = target_rgb.rows, W_orig = target_rgb.cols;
     int max_dim = std::max(H_orig, W_orig);
     scale_ = std::min(1.0f, static_cast<float>(config_.opt_resolution) / max_dim);
-    H_opt_ = std::max(4, static_cast<int>(H_orig * scale_));
-    W_opt_ = std::max(4, static_cast<int>(W_orig * scale_));
+    H_opt_ = std::max(1, static_cast<int>(H_orig * scale_));
+    W_opt_ = std::max(1, static_cast<int>(W_orig * scale_));
 
     VIN_INFO("Optimizer: %dx%d -> %dx%d (scale=%.3f)",
              W_orig, H_orig, W_opt_, H_opt_, scale_);
@@ -76,6 +88,13 @@ std::vector<Shape> GradientOptimizer::optimize(
     mask.convertTo(mask_u8, CV_8U, 255);
     cv::resize(mask_u8, mask_small_, {W_opt_, H_opt_}, 0, 0, cv::INTER_NEAREST);
     mask_small_ = mask_small_ > 127;
+
+    cv::Mat alpha_small;
+    if (!target_alpha.empty()) {
+        CV_Assert(target_alpha.type() == CV_8UC1 && target_alpha.size() == target_rgb.size());
+        cv::resize(target_alpha, alpha_small, {W_opt_, H_opt_}, 0, 0, cv::INTER_AREA);
+        mask_small_ = alpha_small > 0;
+    }
 
     auto facial_weights = build_saliency_weights(saliency_map_, mask_small_);
     saliency_small_ = facial_weights.priority;
@@ -101,9 +120,11 @@ std::vector<Shape> GradientOptimizer::optimize(
             bool opaque = mask_small_.at<uint8_t>(y, x) > 0;
             if (opaque) {
                 auto& c = target_small_.at<cv::Vec3b>(y, x);
-                h_target[idx * 3 + 0] = c[0];
-                h_target[idx * 3 + 1] = c[1];
-                h_target[idx * 3 + 2] = c[2];
+                // Renderer outputs color composited over bg, in linear-light space.
+                const float alpha = alpha_small.empty() ? 1.0f : alpha_small.at<uint8_t>(y, x) / 255.0f;
+                h_target[idx * 3 + 0] = composite_target_color(c[0], bg_color.r, alpha);
+                h_target[idx * 3 + 1] = composite_target_color(c[1], bg_color.g, alpha);
+                h_target[idx * 3 + 2] = composite_target_color(c[2], bg_color.b, alpha);
             } else {
                 // Transparent pixels: target RGB = bg_color (so rendered bg matches)
                 h_target[idx * 3 + 0] = static_cast<float>(bg_color.r);
@@ -111,11 +132,13 @@ std::vector<Shape> GradientOptimizer::optimize(
                 h_target[idx * 3 + 2] = static_cast<float>(bg_color.b);
             }
             h_mask_gpu[idx] = opaque ? 1.0f : 0.0f;
-            h_target_alpha[idx] = opaque ? 255.0f : 0.0f;
+            h_target_alpha[idx] = alpha_small.empty() ? (opaque ? 255.0f : 0.0f)
+                : static_cast<float>(alpha_small.at<uint8_t>(y, x));
         }
     }
     renderer_.set_target(h_target.data(), h_mask_gpu.data(), h_target_alpha.data(),
                          rgb_loss_weights_.ptr<float>());
+    loss_target_small_ = cv::Mat(H_opt_, W_opt_, CV_32FC3, h_target.data()).clone();
 
     // Initialize shapes
     initialize_shapes();
@@ -243,6 +266,7 @@ float GradientOptimizer::run_single_iter(
 
     // Forward + backward on GPU (optionally writes gradient norms to history)
     float mse = renderer_.render_forward_backward(N, d_grad_history, write_idx);
+    capture_best(mse);
 
     // Update frozen mask on GPU
     if (!frozen_indices.empty()) {
@@ -270,251 +294,108 @@ float GradientOptimizer::run_single_iter(
 // Main optimization loop
 // ================================================================
 
+void GradientOptimizer::capture_best(float mse) {
+    if (!std::isfinite(mse)) throw std::runtime_error("Non-finite optimization loss");
+    if (!has_best_ || mse < best_mse_) {
+        // Same stream: copy the evaluated parameters BEFORE Adam modifies them.
+        renderer_.async_snapshot_params(snap_pinned_, snap_event_, params_.N);
+        best_mse_ = mse;
+        has_best_ = true;
+    }
+}
+
 void GradientOptimizer::gradient_optimize() {
-    int N = params_.N;
-    int cycle_global = config_.reloc_cycle_global;
-    int cycle_local = config_.reloc_cycle_local;
-    int cycle_total = cycle_global + cycle_local;
-    int num_cycles = config_.total_iters / cycle_total;
-    int total_global_iters = num_cycles * cycle_global;
+    const int N = params_.N;
+    const int cycle_global = config_.reloc_cycle_global;
+    const int cycle_local = config_.reloc_cycle_local;
+    const int window = config_.reloc_stability_window;
+    if (cycle_global <= 0 || cycle_local < 0 || window <= 0
+        || config_.total_iters < cycle_global + cycle_local)
+        throw std::invalid_argument("Invalid optimization cycle configuration");
+    const int num_cycles = config_.total_iters / (cycle_global + cycle_local);
+    const int total_global_iters = num_cycles * cycle_global;
 
-    // Allocate gradient history ring buffer on GPU
-    int window = config_.reloc_stability_window;
-    {
-        cudaError_t e = cudaMalloc(&d_grad_history_, window * N * sizeof(float));
-        if (e != cudaSuccess) {
-            VIN_ERROR("cudaMalloc failed in gradient_optimize: %s", cudaGetErrorString(e));
-            return;
-        }
-        cudaMemset(d_grad_history_, 0, window * N * sizeof(float));
-    }
-    history_write_idx_ = 0;
-    history_count_ = 0;
-    reloc_total_ = 0;
+    VIN_CUDA(cudaMalloc(&d_grad_history_, static_cast<size_t>(window) * N * sizeof(float)));
+    VIN_CUDA(cudaMemset(d_grad_history_, 0, static_cast<size_t>(window) * N * sizeof(float)));
+    VIN_CUDA(cudaMallocHost(&viz_pinned_, static_cast<size_t>(W_opt_) * H_opt_ * 3));
+    VIN_CUDA(cudaEventCreate(&viz_event_));
+    VIN_CUDA(cudaMallocHost(&snap_pinned_, static_cast<size_t>(N) * 9 * sizeof(float)));
+    VIN_CUDA(cudaEventCreate(&snap_event_));
+    history_write_idx_ = history_count_ = reloc_total_ = 0;
     reloc_converged_ = false;
-
-    std::vector<float> grads(N * 9, 0.0f);
-
-    // Upload initial parameters to GPU-resident buffers
-    {
-        renderer_.upload_params_gpu(params_.to_shape_params().data(), N);
-    }
-
-    // Initialize async visualization pipeline
-    int viz_size = W_opt_ * H_opt_ * 3;
-    {
-        cudaError_t e = cudaMallocHost(&viz_pinned_, viz_size * sizeof(uint8_t));
-        if (e != cudaSuccess) {
-            VIN_WARN("cudaMallocHost failed for visualization: %s", cudaGetErrorString(e));
-            viz_pinned_ = nullptr;
-        }
-    }
-    cudaEventCreate(&viz_event_);
     viz_first_frame_ = true;
-
-    // Allocate pinned memory and event for async param snapshots
-    {
-        cudaError_t e = cudaMallocHost(&snap_pinned_, N * 9 * sizeof(float));
-        if (e != cudaSuccess) {
-            VIN_WARN("cudaMallocHost failed for snapshots: %s", cudaGetErrorString(e));
-            snap_pinned_ = nullptr;
-        }
-    }
-    cudaEventCreate(&snap_event_);
-    best_mse_ = 1e20f;
     has_best_ = false;
-    snap_pending_ = false;
-
-    VIN_INFO("Starting optimization: %d cycles (%d global + %d local), lr=%.3f->%.3f",
-             num_cycles, cycle_global, cycle_local, config_.lr_start, config_.lr_end);
-
+    best_mse_ = 1e20f;
+    renderer_.upload_params_gpu(params_.to_shape_params().data(), N);
+    std::vector<float> grads(N * 9, 0.0f);
     int global_iter = 0;
 
-    for (int cycle_idx = 0; cycle_idx < num_cycles; ++cycle_idx) {
-        if (stop_requested_) break;
-
-        // Consume previous cycle's async snapshot
-        if (snap_pending_ && snap_pinned_ && N > 0) {
-            cudaEventSynchronize(snap_event_);
-            if (cycle_mse_ < best_mse_) {
-                best_mse_ = cycle_mse_;
-                best_params_flat_.resize(N * 9);
-                memcpy(&best_params_flat_[0 * N], snap_pinned_ + 0 * N, N * sizeof(float));
-                memcpy(&best_params_flat_[1 * N], snap_pinned_ + 1 * N, N * sizeof(float));
-                memcpy(&best_params_flat_[2 * N], snap_pinned_ + 2 * N, N * sizeof(float));
-                memcpy(&best_params_flat_[3 * N], snap_pinned_ + 3 * N, N * sizeof(float));
-                memcpy(&best_params_flat_[4 * N], snap_pinned_ + 4 * N, N * sizeof(float));
-                for (int i = 0; i < N; ++i) {
-                    best_params_flat_[5 * N + i] = snap_pinned_[5 * N + i * 3 + 0];
-                    best_params_flat_[6 * N + i] = snap_pinned_[5 * N + i * 3 + 1];
-                    best_params_flat_[7 * N + i] = snap_pinned_[5 * N + i * 3 + 2];
-                }
-                memcpy(&best_params_flat_[8 * N], snap_pinned_ + 8 * N, N * sizeof(float));
-                has_best_ = true;
+    for (int cycle = 0; cycle < num_cycles && !should_stop(); ++cycle) {
+        for (int gi = 0; gi < cycle_global && !should_stop(); ++gi) {
+            if (!viz_first_frame_) {
+                VIN_CUDA(cudaEventSynchronize(viz_event_));
+                cv::Mat frame(H_opt_, W_opt_, CV_8UC3, viz_pinned_);
+                std::lock_guard<std::mutex> lock(viz_mutex_);
+                const int index = viz_write_idx_.load();
+                canvas_rgb_[index] = frame.clone(); // Own pixels, never alias the next DMA destination.
+                viz_write_idx_.store(1 - index);
             }
-            snap_pending_ = false;
-        }
-
-        // Phase A: Global optimization
-        for (int gi = 0; gi < cycle_global; ++gi) {
-            if (stop_requested_) break;
-
-            // Synchronize previous async canvas copy and update canvas_rgb_
-            if (!viz_first_frame_ && viz_pinned_) {
-                cudaEventSynchronize(viz_event_);
-                cv::Mat rgb_mat(H_opt_, W_opt_, CV_8UC3, viz_pinned_);
-                int write_idx = viz_write_idx_.load();
-                {
-                    std::lock_guard<std::mutex> lock(viz_mutex_);
-                    canvas_rgb_[write_idx] = rgb_mat;
-                }
-                // Swap write buffer for next frame
-                viz_write_idx_.store(1 - write_idx);
-            }
-
-            float mse = run_single_iter(params_, grads,
-                                        global_iter, total_global_iters,
-                                        d_grad_history_, history_write_idx_);
-            cycle_mse_ = mse;
-
-            // Async copy canvas to pinned memory for visualization
-            if (viz_pinned_) {
-                renderer_.async_copy_canvas(viz_pinned_, viz_event_);
-                viz_first_frame_ = false;
-            }
-
-            // Update ring buffer write index
+            const float mse = run_single_iter(params_, grads, global_iter, total_global_iters,
+                                               d_grad_history_, history_write_idx_);
+            renderer_.async_copy_canvas(viz_pinned_, viz_event_);
+            viz_first_frame_ = false;
             history_write_idx_ = (history_write_idx_ + 1) % window;
             history_count_ = std::min(history_count_ + 1, window);
-
-            if (gi % 50 == 0) {
-                VIN_INFO("  cycle %d/%d, iter %d, mse=%.1f", cycle_idx + 1, num_cycles,
-                         global_iter, mse);
-            }
-
-            if (progress_cb_) {
-                progress_cb_(static_cast<float>(global_iter) / total_global_iters,
-                            mse, global_iter);
-            }
-
-            global_iter++;
+            ++global_iter;
+            if (progress_cb_) progress_cb_(static_cast<float>(global_iter) / total_global_iters, mse, global_iter);
         }
-
-        // Queue async param snapshot at end of Phase A
-        if (snap_pinned_ && N > 0) {
-            renderer_.async_snapshot_params(snap_pinned_, snap_event_, N);
-            snap_pending_ = true;
-        }
-
-        if (stop_requested_) break;
-
-        // Phase B: Relocation scan
-        bool is_last_cycle = (cycle_idx == num_cycles - 1);
-        std::vector<int> cand_indices;
-        int n_useful = 0, n_useless = 0, n_unstable = 0;
-
-        if (!reloc_converged_ && !is_last_cycle) {
-            // Download grads from GPU for relocation analysis
+        if (should_stop()) break;
+        const bool last_cycle = cycle == num_cycles - 1;
+        std::vector<int> candidates;
+        int useful = 0, useless = 0, unstable = 0;
+        if (!reloc_converged_ && !last_cycle) {
+            // Refresh output/gradients after the most recent Adam step.
+            capture_best(renderer_.render_forward_backward(N));
             renderer_.download_grads_packed(grads.data(), N);
-            // Compute and download per-shape visibility (blend weight sum)
             renderer_.compute_visibility(N);
-            std::vector<float> h_visibility(N);
-            renderer_.download_visibility(h_visibility.data(), N);
-            // Sync GPU params to CPU for relocation
-            {
-                auto sp = params_.to_shape_params();
-                renderer_.download_params_gpu(sp.data(), N);
-                // Copy back to CPU params
-                for (int i = 0; i < N; ++i) params_.set_shape(i, sp[i]);
-            }
-            find_relocation_candidates(grads, h_visibility, cand_indices, n_useful, n_useless, n_unstable);
+            std::vector<float> visibility(N);
+            renderer_.download_visibility(visibility.data(), N);
+            auto shapes = params_.to_shape_params();
+            renderer_.download_params_gpu(shapes.data(), N);
+            for (int i = 0; i < N; ++i) params_.set_shape(i, shapes[i]);
+            find_relocation_candidates(grads, visibility, candidates, useful, useless, unstable);
         }
-
-        // Phase C: Local optimization
-        if (!cand_indices.empty()) {
-            auto new_indices = relocate_shapes(params_, cand_indices);
-            // Upload relocated params to GPU
-            {
-                renderer_.upload_params_gpu(params_.to_shape_params().data(), N);
-            }
-            // Reset ALL Adam state (z-order compact invalidates old momentum)
+        if (!candidates.empty()) {
+            auto indices = relocate_shapes(params_, candidates);
+            renderer_.upload_params_gpu(params_.to_shape_params().data(), N);
             renderer_.reset_adam_state_all_gpu(N);
-            adam_step_ = 0;
-            history_write_idx_ = 0;
-            history_count_ = 0;
-            run_local_phase(params_, new_indices, cycle_local);
-        } else if (!is_last_cycle && n_useless == 0 && n_unstable == 0) {
+            adam_step_ = history_write_idx_ = history_count_ = 0;
+            run_local_phase(params_, indices, cycle_local);
+        } else if (!last_cycle && useless == 0 && unstable == 0) {
             reloc_converged_ = true;
         }
-
-        VIN_INFO("Cycle %d/%d: reloc=%d, useful=%d, useless=%d, unstable=%d, converged=%d",
-                 cycle_idx + 1, num_cycles, static_cast<int>(cand_indices.size()),
-                 n_useful, n_useless, n_unstable, reloc_converged_);
+        VIN_INFO("Cycle %d/%d: relocated=%zu", cycle + 1, num_cycles, candidates.size());
     }
 
-    // Consume last cycle's snapshot
-    if (snap_pending_ && snap_pinned_ && N > 0) {
-        cudaEventSynchronize(snap_event_);
-        if (cycle_mse_ < best_mse_) {
-            best_mse_ = cycle_mse_;
-            best_params_flat_.resize(N * 9);
-            memcpy(&best_params_flat_[0 * N], snap_pinned_ + 0 * N, N * sizeof(float));
-            memcpy(&best_params_flat_[1 * N], snap_pinned_ + 1 * N, N * sizeof(float));
-            memcpy(&best_params_flat_[2 * N], snap_pinned_ + 2 * N, N * sizeof(float));
-            memcpy(&best_params_flat_[3 * N], snap_pinned_ + 3 * N, N * sizeof(float));
-            memcpy(&best_params_flat_[4 * N], snap_pinned_ + 4 * N, N * sizeof(float));
-            for (int i = 0; i < N; ++i) {
-                best_params_flat_[5 * N + i] = snap_pinned_[5 * N + i * 3 + 0];
-                best_params_flat_[6 * N + i] = snap_pinned_[5 * N + i * 3 + 1];
-                best_params_flat_[7 * N + i] = snap_pinned_[5 * N + i * 3 + 2];
-            }
-            memcpy(&best_params_flat_[8 * N], snap_pinned_ + 8 * N, N * sizeof(float));
-            has_best_ = true;
-        }
-        snap_pending_ = false;
+    // Include the final update (or initial state when stopped immediately).
+    capture_best(renderer_.render_forward_backward(N));
+    VIN_CUDA(cudaEventSynchronize(snap_event_));
+    for (int i = 0; i < N; ++i) {
+        params_.cx[i] = snap_pinned_[i];
+        params_.cy[i] = snap_pinned_[N + i];
+        params_.rx[i] = snap_pinned_[2 * N + i];
+        params_.ry[i] = snap_pinned_[3 * N + i];
+        params_.angle[i] = snap_pinned_[4 * N + i];
+        params_.color_r[i] = snap_pinned_[5 * N + 3 * i];
+        params_.color_g[i] = snap_pinned_[5 * N + 3 * i + 1];
+        params_.color_b[i] = snap_pinned_[5 * N + 3 * i + 2];
+        params_.color_a[i] = snap_pinned_[8 * N + i] * 255.0f;
     }
-
-    // Restore best params to CPU + GPU if a better snapshot was found
-    if (has_best_ && N > 0) {
-        for (int i = 0; i < N; ++i) {
-            params_.cx[i] = best_params_flat_[0 * N + i];
-            params_.cy[i] = best_params_flat_[1 * N + i];
-            params_.rx[i] = best_params_flat_[2 * N + i];
-            params_.ry[i] = best_params_flat_[3 * N + i];
-            params_.angle[i] = best_params_flat_[4 * N + i];
-            params_.color_r[i] = best_params_flat_[5 * N + i];
-            params_.color_g[i] = best_params_flat_[6 * N + i];
-            params_.color_b[i] = best_params_flat_[7 * N + i];
-            params_.color_a[i] = best_params_flat_[8 * N + i] * 255.0f;
-        }
-        renderer_.upload_params_gpu(params_.to_shape_params().data(), N);
-        VIN_INFO("Restored best cycle params: MSE=%.1f", best_mse_);
-    }
-
-    // Free snapshot resources
-    if (snap_pinned_) {
-        cudaFreeHost(snap_pinned_);
-        snap_pinned_ = nullptr;
-    }
-    if (snap_event_) {
-        cudaEventDestroy(snap_event_);
-        snap_event_ = nullptr;
-    }
-
-    // Cleanup — sync render stream only (avoid OpenGL-blocking device sync)
+    renderer_.upload_params_gpu(params_.to_shape_params().data(), N);
     renderer_.sync_stream();
-    if (d_grad_history_) {
-        cudaFree(d_grad_history_);
-        d_grad_history_ = nullptr;
-    }
-    if (viz_pinned_) {
-        cudaFreeHost(viz_pinned_);
-        viz_pinned_ = nullptr;
-    }
-    if (viz_event_) {
-        cudaEventDestroy(viz_event_);
-        viz_event_ = nullptr;
-    }
+    if (progress_cb_) progress_cb_(should_stop() ? static_cast<float>(global_iter) / total_global_iters : 1.0f,
+                                  best_mse_, global_iter);
+    VIN_INFO("Restored best evaluated parameters: MSE=%.3f", best_mse_);
 }
 
 // ================================================================
@@ -537,8 +418,8 @@ void GradientOptimizer::find_relocation_candidates(
 
     // Download gradient history from GPU
     std::vector<float> h_history(window * N);
-    cudaMemcpy(h_history.data(), d_grad_history_, window * N * sizeof(float),
-               cudaMemcpyDeviceToHost);
+    VIN_CUDA(cudaMemcpy(h_history.data(), d_grad_history_, window * N * sizeof(float),
+               cudaMemcpyDeviceToHost));
 
     // Reconstruct chronological order from ring buffer
     std::vector<float> chronological(window * N);
@@ -605,7 +486,7 @@ std::vector<int> GradientOptimizer::relocate_shapes(OptParams& params,
         for (int x = 0; x < W_opt_; ++x) {
             int idx = y * W_opt_ + x;
             if (!mask_small_.at<uint8_t>(y, x)) continue;
-            auto& tc = target_small_.at<cv::Vec3b>(y, x);
+            auto& tc = loss_target_small_.at<cv::Vec3f>(y, x);
             float dr = rendered[idx * 3 + 0] - tc[0];
             float dg = rendered[idx * 3 + 1] - tc[1];
             float db = rendered[idx * 3 + 2] - tc[2];
@@ -711,7 +592,7 @@ float GradientOptimizer::run_local_phase(OptParams& params,
     float final_mse = 0.0f;
 
     for (int li = 0; li < num_iters; ++li) {
-        if (stop_requested_) break;
+        if (should_stop()) break;
 
         final_mse = run_single_iter(params, grads, li, num_iters,
                                      nullptr, 0, true, frozen_indices);

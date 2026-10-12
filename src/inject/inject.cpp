@@ -3,7 +3,9 @@
 #include "common/path_utils.h"
 
 #ifdef _WIN32
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 #include <tlhelp32.h>
 #include <psapi.h>
@@ -15,6 +17,8 @@
 #include <ctime>
 #include <unordered_map>
 #include <unordered_set>
+#include <iostream>
+#include <cmath>
 
 namespace vinylizer {
 
@@ -53,18 +57,12 @@ static bool read_mem(HANDLE h, uint64_t addr, void* buf, size_t size, size_t* nr
     SIZE_T nr = 0;
     BOOL ok = ReadProcessMemory(h, reinterpret_cast<LPCVOID>(addr), buf, size, &nr);
     if (nread) *nread = nr;
-    return ok && nr > 0;
+    return ok && nr == size;
 }
 
 static bool write_mem(HANDLE h, uint64_t addr, const void* buf, size_t size) {
     SIZE_T nw = 0;
     return WriteProcessMemory(h, reinterpret_cast<LPVOID>(addr), buf, size, &nw) && nw == size;
-}
-
-static uint16_t read_u16(HANDLE h, uint64_t addr) {
-    uint16_t v = 0;
-    read_mem(h, addr, &v, 2);
-    return v;
 }
 
 static uint64_t read_u64(HANDLE h, uint64_t addr) {
@@ -86,8 +84,8 @@ static bool is_private_writable(HANDLE h, uint64_t addr) {
         && mbi.Type == MEM_PRIVATE
         && !(mbi.Protect & PAGE_GUARD)
         && !(mbi.Protect & PAGE_NOACCESS)
-        && (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
-                           PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+        && (mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY |
+                           PAGE_EXECUTE_READWRITE |
                            PAGE_EXECUTE_WRITECOPY));
 }
 
@@ -98,8 +96,8 @@ static bool is_valid_layer_ptr(HANDLE h, uint64_t ptr) {
         return false;
     if (!(mbi.State == MEM_COMMIT && !(mbi.Protect & PAGE_GUARD)
           && !(mbi.Protect & PAGE_NOACCESS)
-          && (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
-                             PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+          && (mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY |
+                             PAGE_EXECUTE_READWRITE |
                              PAGE_EXECUTE_WRITECOPY))))
         return false;
     uint64_t region_end = reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize;
@@ -148,7 +146,7 @@ std::vector<nlohmann::json> validate_json(const std::string& path) {
     nlohmann::json data;
     try {
         data = nlohmann::json::parse(file);
-    } catch (const nlohmann::json::parse_error& e) {
+    } catch (const nlohmann::json::exception& e) {
         VIN_ERROR("JSON parse error: %s", e.what());
         return {};
     }
@@ -158,11 +156,15 @@ std::vector<nlohmann::json> validate_json(const std::string& path) {
         return {};
     }
 
+    if (data["shapes"].empty() || data["shapes"].size() > MAX_LAYER_COUNT) {
+        VIN_ERROR("Shape count must be in [1, %d]", MAX_LAYER_COUNT);
+        return {};
+    }
     std::vector<nlohmann::json> valid_shapes;
     for (const auto& shape : data["shapes"]) {
-        int type = shape.value("type", -1);
-        if (type != 1 && type != 16 && type != 228) {
-            VIN_ERROR("Unsupported shape type: %d", type);
+        std::string error;
+        if (!validate_shape(shape, error)) {
+            VIN_ERROR("Invalid shape[%zu]: %s", valid_shapes.size(), error.c_str());
             return {};
         }
         valid_shapes.push_back(shape);
@@ -199,14 +201,20 @@ static bool strict_check_layer(HANDLE h, uint64_t ptr) {
     float scale[2];
     if (!read_mem(h, ptr + LAYER_SCALE_OFFSET, scale, 8)) return false;
 
-    return true;
+    float rotation;
+    if (!read_mem(h, ptr + LAYER_ROTATION_OFFSET, &rotation, 4)) return false;
+    return std::isfinite(pos[0]) && std::isfinite(pos[1])
+        && std::isfinite(scale[0]) && std::isfinite(scale[1])
+        && scale[0] >= 0 && scale[1] >= 0 && std::isfinite(rotation);
 }
 
 // ================================================================
 // Locate layer table
 // ================================================================
 
-uint64_t locate_layer_table(int pid, int layer_count) {
+uint64_t locate_layer_table(int pid, int layer_count, uint64_t* group_out) {
+    if (group_out) *group_out = 0;
+    if (layer_count <= 0 || layer_count > MAX_LAYER_COUNT) return 0;
     HANDLE h = OpenProcess(ACCESS_MASK, FALSE, pid);
     if (!h) {
         VIN_ERROR("Cannot open process %d", pid);
@@ -238,7 +246,9 @@ uint64_t locate_layer_table(int pid, int layer_count) {
             if (ReadProcessMemory(h, reinterpret_cast<LPCVOID>(base), mem.data(), read_size, &nr) && nr >= 2) {
                 mem.resize(nr);
                 for (size_t i = 0; i + 1 < mem.size(); ++i) {
-                    if (*reinterpret_cast<uint16_t*>(&mem[i]) != pattern) continue;
+                    uint16_t value;
+                    std::memcpy(&value, &mem[i], sizeof(value));
+                    if (value != pattern) continue;
 
                     uint64_t count_address = base + i;
                     uint64_t group_address = count_address - LIVERY_COUNT_OFFSET;
@@ -248,20 +258,11 @@ uint64_t locate_layer_table(int pid, int layer_count) {
                     if (!is_user_pointer(table_address)) continue;
                     if (!is_private_writable(h, table_address)) continue;
 
-                    // Strict validation: ALL sampled layers must pass
-                    int n = std::min(layer_count, 64);
-                    int pass_count = 0;
-                    for (int idx = 0; idx < n; ++idx) {
-                        uint64_t layer_ptr = read_u64(h, table_address + idx * 8);
-                        if (!is_valid_layer_ptr(h, layer_ptr)) { pass_count = -1; break; }
-                        if (!strict_check_layer(h, layer_ptr)) { pass_count = -1; break; }
-                        pass_count++;
-                    }
-
-                    if (pass_count == n) {
+                    if (validate_layer_table_h(h, table_address, layer_count)) {
+                        if (group_out) *group_out = group_address;
                         CloseHandle(h);
                         VIN_INFO("Found layer table at 0x%llX (group=0x%llX, all %d layers passed strict check)",
-                                 table_address, group_address, n);
+                                 table_address, group_address, layer_count);
                         return table_address;
                     }
                 }
@@ -282,6 +283,25 @@ uint64_t locate_layer_table(int pid, int layer_count) {
 // Count valid layers and classify by shape_id
 // ================================================================
 
+bool layer_table_matches_h(HANDLE h, uint64_t group_address, uint64_t table_address, int layer_count) {
+    uint16_t count = 0;
+    uint64_t table = 0;
+    return is_user_pointer(group_address) && layer_count > 0 && layer_count <= MAX_LAYER_COUNT
+        && read_mem(h, group_address + LIVERY_COUNT_OFFSET, &count, sizeof(count))
+        && read_mem(h, group_address + LAYER_TABLE_OFFSET, &table, sizeof(table))
+        && count == layer_count && table == table_address;
+}
+
+bool validate_layer_table_h(HANDLE h, uint64_t table_address, int layer_count) {
+    if (layer_count <= 0 || layer_count > MAX_LAYER_COUNT || !is_private_writable(h, table_address)) return false;
+    std::unordered_set<uint64_t> pointers;
+    for (int i = 0; i < layer_count; ++i) {
+        uint64_t ptr = read_u64(h, table_address + static_cast<uint64_t>(i) * 8);
+        if (!pointers.insert(ptr).second || !is_valid_layer_ptr(h, ptr) || !strict_check_layer(h, ptr)) return false;
+    }
+    return true;
+}
+
 LayerStats count_valid_layers(int pid, uint64_t table_address, int layer_count) {
     LayerStats stats;
     HANDLE h = OpenProcess(ACCESS_MASK, FALSE, pid);
@@ -289,7 +309,7 @@ LayerStats count_valid_layers(int pid, uint64_t table_address, int layer_count) 
 
     for (int i = 0; i < layer_count; ++i) {
         uint64_t layer_ptr = read_u64(h, table_address + i * 8);
-        if (!is_valid_layer_ptr(h, layer_ptr)) continue;
+        if (!is_valid_layer_ptr(h, layer_ptr) || !strict_check_layer(h, layer_ptr)) continue;
 
         uint8_t shape_id;
         if (!read_mem(h, layer_ptr + LAYER_SHAPE_ID_OFFSET, &shape_id, 1)) continue;
@@ -340,16 +360,14 @@ std::vector<LayerInfo> sample_layers(int pid, uint64_t table_address, int layer_
         info.ptr = layer_ptr;
 
         float pos[2], scale[2];
-        if (read_mem(h, layer_ptr + LAYER_POSITION_OFFSET, pos, 8)) {
-            info.pos_x = pos[0]; info.pos_y = pos[1];
-        }
-        if (read_mem(h, layer_ptr + LAYER_SCALE_OFFSET, scale, 8)) {
-            info.scale_x = scale[0]; info.scale_y = scale[1];
-        }
-        read_mem(h, layer_ptr + LAYER_ROTATION_OFFSET, &info.rotation, 4);
-        read_mem(h, layer_ptr + LAYER_COLOR_OFFSET, info.color, 4);
-        read_mem(h, layer_ptr + LAYER_SHAPE_ID_OFFSET, &info.shape_id, 1);
-        read_mem(h, layer_ptr + LAYER_MASK_OFFSET, &info.mask, 1);
+        if (!read_mem(h, layer_ptr + LAYER_POSITION_OFFSET, pos, 8)
+            || !read_mem(h, layer_ptr + LAYER_SCALE_OFFSET, scale, 8)
+            || !read_mem(h, layer_ptr + LAYER_ROTATION_OFFSET, &info.rotation, 4)
+            || !read_mem(h, layer_ptr + LAYER_COLOR_OFFSET, info.color, 4)
+            || !read_mem(h, layer_ptr + LAYER_SHAPE_ID_OFFSET, &info.shape_id, 1)
+            || !read_mem(h, layer_ptr + LAYER_MASK_OFFSET, &info.mask, 1)) continue;
+        info.pos_x = pos[0]; info.pos_y = pos[1];
+        info.scale_x = scale[0]; info.scale_y = scale[1];
 
         result.push_back(info);
     }
@@ -390,8 +408,10 @@ LayerInfo read_layer_info(int pid, uint64_t layer_ptr) {
 // ================================================================
 
 bool write_layer_h(HANDLE h, uint64_t table_address, int index, const nlohmann::json& shape_data) {
+    std::string error;
+    if (index < 0 || index >= MAX_LAYER_COUNT || !validate_shape(shape_data, error)) return false;
     uint64_t layer_ptr = read_u64(h, table_address + index * 8);
-    if (!is_valid_layer_ptr(h, layer_ptr)) {
+    if (!is_valid_layer_ptr(h, layer_ptr) || !strict_check_layer(h, layer_ptr)) {
         VIN_ERROR("Layer[%d] invalid pointer: 0x%llX", index, layer_ptr);
         return false;
     }
@@ -407,7 +427,7 @@ bool write_layer_h(HANDLE h, uint64_t table_address, int index, const nlohmann::
     float pos_data[2] = {x, -y};
     int divisor = SCALE_DIVISOR.count(shape_type) ? SCALE_DIVISOR.at(shape_type) : 63;
     float scale_data[2] = {w / divisor, h_val / divisor};
-    float rot_data = 360.0f - rot_deg;
+    float rot_data = std::fmod(360.0f - std::fmod(rot_deg, 360.0f), 360.0f);
     uint8_t color_data[4] = {
         static_cast<uint8_t>(color[0]), static_cast<uint8_t>(color[1]),
         static_cast<uint8_t>(color[2]), static_cast<uint8_t>(color[3])
@@ -418,12 +438,15 @@ bool write_layer_h(HANDLE h, uint64_t table_address, int index, const nlohmann::
     // Read old values for rollback
     float old_pos[2], old_scale[2], old_rot;
     uint8_t old_color[4], old_shape_id, old_mask;
-    read_mem(h, layer_ptr + LAYER_POSITION_OFFSET, old_pos, 8);
-    read_mem(h, layer_ptr + LAYER_SCALE_OFFSET, old_scale, 8);
-    read_mem(h, layer_ptr + LAYER_ROTATION_OFFSET, &old_rot, 4);
-    read_mem(h, layer_ptr + LAYER_COLOR_OFFSET, old_color, 4);
-    read_mem(h, layer_ptr + LAYER_SHAPE_ID_OFFSET, &old_shape_id, 1);
-    read_mem(h, layer_ptr + LAYER_MASK_OFFSET, &old_mask, 1);
+    if (!read_mem(h, layer_ptr + LAYER_POSITION_OFFSET, old_pos, 8)
+        || !read_mem(h, layer_ptr + LAYER_SCALE_OFFSET, old_scale, 8)
+        || !read_mem(h, layer_ptr + LAYER_ROTATION_OFFSET, &old_rot, 4)
+        || !read_mem(h, layer_ptr + LAYER_COLOR_OFFSET, old_color, 4)
+        || !read_mem(h, layer_ptr + LAYER_SHAPE_ID_OFFSET, &old_shape_id, 1)
+        || !read_mem(h, layer_ptr + LAYER_MASK_OFFSET, &old_mask, 1)) {
+        VIN_ERROR("Layer[%d] backup read failed; nothing written", index);
+        return false;
+    }
 
     // Write new values with rollback on failure
     struct Write { uint64_t offset; const void* data; size_t size; const void* old_data; };
@@ -440,8 +463,9 @@ bool write_layer_h(HANDLE h, uint64_t table_address, int index, const nlohmann::
     for (auto& w : writes) {
         if (!write_mem(h, layer_ptr + w.offset, w.data, w.size)) {
             // Rollback
-            for (int j = completed - 1; j >= 0; --j) {
-                write_mem(h, layer_ptr + writes[j].offset, writes[j].old_data, writes[j].size);
+            for (int j = completed; j >= 0; --j) {
+                if (!write_mem(h, layer_ptr + writes[j].offset, writes[j].old_data, writes[j].size))
+                    VIN_ERROR("Layer[%d] rollback failed at offset 0x%llX", index, writes[j].offset);
             }
             VIN_ERROR("Layer[%d] write failed at offset 0x%llX", index, w.offset);
             return false;
@@ -491,7 +515,11 @@ bool inject_shapes(const InjectConfig& config) {
     auto shapes = validate_json(config.json_path);
     if (shapes.empty()) return false;
 
-    int layer_count = config.layer_count > 0 ? config.layer_count : static_cast<int>(shapes.size());
+    int layer_count = config.layer_count;
+    if (!valid_layer_count(layer_count, shapes.size())) {
+        VIN_ERROR("Placeholder count must exactly match JSON shape count (1..65535)");
+        return false;
+    }
 
     // Find FH6 process
     int pid = config.process_id;
@@ -508,8 +536,23 @@ bool inject_shapes(const InjectConfig& config) {
     VIN_INFO("Found FH6: PID=%d", pid);
 
     // Locate layer table
-    uint64_t table_address = locate_layer_table(pid, layer_count);
+    uint64_t group_address = 0;
+    uint64_t table_address = locate_layer_table(pid, layer_count, &group_address);
     if (table_address == 0) return false;
+
+    auto stats = count_valid_layers(pid, table_address, layer_count);
+    if (stats.total_valid != layer_count) return false;
+    VIN_INFO("Layers: %d rectangles, %d ellipses", stats.count_101, stats.count_102);
+    auto samples = sample_layers(pid, table_address, layer_count, 6);
+    if (samples.size() != static_cast<size_t>(std::min(layer_count, 6))) return false;
+    for (const auto& s : samples) {
+        VIN_INFO("Layer[%d] position=(%.2f,%.2f) scale=(%.4f,%.4f) angle=%.2f RGBA=(%u,%u,%u,%u) shape=%u mask=%u",
+            s.index, s.pos_x, s.pos_y, s.scale_x, s.scale_y, s.rotation,
+            s.color[0], s.color[1], s.color[2], s.color[3], s.shape_id, s.mask);
+    }
+    std::cout << "Verify these placeholders in FH6. Enter Y to import: " << std::flush;
+    std::string confirmation;
+    if (!std::getline(std::cin, confirmation) || (confirmation != "Y" && confirmation != "y")) return false;
 
     // Write shapes
     HANDLE h = OpenProcess(ACCESS_MASK, FALSE, pid);
@@ -518,20 +561,21 @@ bool inject_shapes(const InjectConfig& config) {
         return false;
     }
 
+    if (!layer_table_matches_h(h, group_address, table_address, layer_count)
+        || !validate_layer_table_h(h, table_address, layer_count)) {
+        VIN_ERROR("Layer table changed or failed validation; import cancelled");
+        CloseHandle(h);
+        return false;
+    }
     int success = 0, fail = 0;
-    int write_count = std::min(static_cast<int>(shapes.size()), layer_count);
 
     for (int i = 0; i < layer_count; ++i) {
-        bool ok;
-        if (i < write_count) {
-            ok = write_layer_h(h, table_address, i, shapes[i]);
-        } else {
-            ok = write_clear_layer_h(h, table_address, i);
-        }
+        bool ok = layer_table_matches_h(h, group_address, table_address, layer_count)
+            && write_layer_h(h, table_address, i, shapes[i]);
         if (ok) success++; else fail++;
 
-        if (fail >= 10 && success == 0) {
-            VIN_ERROR("Too many failures, aborting");
+        if (fail > 0) {
+            VIN_ERROR("Write failed; stopping after %d completed layers", success);
             break;
         }
     }

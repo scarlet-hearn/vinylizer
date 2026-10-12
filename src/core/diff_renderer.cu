@@ -1,4 +1,6 @@
 #include "core/diff_renderer.h"
+#include "cuda/check.h"
+#include <limits>
 #include "core/pixel_loss.cuh"
 #include "common/logger.h"
 #include "common/alpha_228.h"
@@ -147,7 +149,7 @@ __global__ void mse_grad_kernel(
     float* __restrict__ mse_sum,          // [1] atomic result
     int C,
     const float* __restrict__ rendered_alpha,  // [C] rendered alpha (0-255)
-    const float* __restrict__ target_alpha,    // [C] target alpha (0 or 255)
+    const float* __restrict__ target_alpha,    // [C] target alpha in [0, 255]
     float* __restrict__ grad_alpha)            // [C] alpha gradient output
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -173,6 +175,13 @@ __global__ void mse_grad_kernel(
     } else if (grad_alpha) {
         grad_alpha[idx] = 0.0f;
     }
+}
+
+__global__ void quantize_appearance(float* colors, float* opacity, int N) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+    for (int c = 0; c < 3; ++c) colors[3 * i + c] = roundf(colors[3 * i + c]);
+    opacity[i] = roundf(opacity[i] * 255.0f) / 255.0f;
 }
 
 // Convert float RGB [0-255] canvas to uint8 RGB
@@ -335,33 +344,13 @@ __global__ void scale_grads_kernel_v2(
 
 namespace vinylizer {
 
-#define CUDA_CHECK(call) \
-    do { \
-        cudaError_t err = (call); \
-        if (err != cudaSuccess) { \
-            VIN_ERROR("CUDA error at %s:%d: %s", __FILE__, __LINE__, \
-                      cudaGetErrorString(err)); \
-        } \
-    } while (0)
-
-#ifdef _DEBUG
-#define CUDA_KERNEL_CHECK() \
-    do { \
-        cudaError_t _err = cudaGetLastError(); \
-        if (_err != cudaSuccess) { \
-            VIN_ERROR("CUDA kernel error at %s:%d: %s", __FILE__, __LINE__, \
-                      cudaGetErrorString(_err)); \
-        } \
-    } while (0)
-#else
-#define CUDA_KERNEL_CHECK() ((void)0)
-#endif
+#define CUDA_CHECK(call) VIN_CUDA(call)
+#define CUDA_KERNEL_CHECK() VIN_CUDA(cudaGetLastError())
 
 DiffRenderer::~DiffRenderer() {
-    if (!initialized_) return;
-
     auto& s = scratch_;
-    cudaStreamDestroy(s.stream);
+    // Partial initialization also owns resources. Destruction must never throw.
+    if (s.stream) cudaStreamSynchronize(s.stream);
 
     // Free device memory
     cudaFree(s.d_px); cudaFree(s.d_py);
@@ -410,12 +399,20 @@ DiffRenderer::~DiffRenderer() {
     if (s.alpha_array) cudaFreeArray(s.alpha_array);
 
     // Free pinned host memory
-    cudaFreeHost(s.h_cx); cudaFreeHost(s.h_cy);
-    cudaFreeHost(s.h_rx); cudaFreeHost(s.h_ry);
-    cudaFreeHost(s.h_px); cudaFreeHost(s.h_py);
+    if (s.h_cx) cudaFreeHost(s.h_cx);
+    if (s.h_cy) cudaFreeHost(s.h_cy);
+    if (s.h_rx) cudaFreeHost(s.h_rx);
+    if (s.h_ry) cudaFreeHost(s.h_ry);
+    if (s.h_px) cudaFreeHost(s.h_px);
+    if (s.h_py) cudaFreeHost(s.h_py);
+    if (s.stream) cudaStreamDestroy(s.stream);
 }
 
 void DiffRenderer::init(int canvas_w, int canvas_h, int max_shapes) {
+    if (initialized_ || scratch_.stream) throw std::logic_error("Renderer already initialized");
+    if (canvas_w <= 0 || canvas_h <= 0 || max_shapes <= 0 || max_shapes > 65535
+        || static_cast<long long>(canvas_w) * canvas_h > std::numeric_limits<int>::max() / 4)
+        throw std::invalid_argument("Invalid render dimensions or layer count");
     canvas_w_ = canvas_w;
     canvas_h_ = canvas_h;
     max_shapes_ = max_shapes;
@@ -910,6 +907,9 @@ void DiffRenderer::upload_params_gpu(const ShapeParams* shapes, int N) {
     CUDA_CHECK(cudaMemcpyAsync(s.d_ste_angle, s.d_angle, N * sizeof(float), cudaMemcpyDeviceToDevice, s.stream));
     CUDA_CHECK(cudaMemcpyAsync(s.d_ste_colors, s.d_colors, N * 3 * sizeof(float), cudaMemcpyDeviceToDevice, s.stream));
     CUDA_CHECK(cudaMemcpyAsync(s.d_ste_opacity, s.d_opacity, N * sizeof(float), cudaMemcpyDeviceToDevice, s.stream));
+    // Initial, relocated and restored states must match the exported 8-bit appearance.
+    quantize_appearance<<<(N + 255) / 256, 256, 0, s.stream>>>(s.d_ste_colors, s.d_ste_opacity, N);
+    CUDA_KERNEL_CHECK();
 }
 
 void DiffRenderer::fused_adam_update(

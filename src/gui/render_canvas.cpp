@@ -14,6 +14,7 @@
 #include <opencv2/imgproc.hpp>
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace vinylizer {
 
@@ -56,6 +57,7 @@ RenderCanvas::~RenderCanvas() {
         opt_worker_->wait();
     }
     if (inject_worker_) {
+        inject_worker_->confirm(false);
         inject_worker_->wait();
     }
 }
@@ -200,13 +202,15 @@ void RenderCanvas::draw_done_state(QPainter& p) {
     // "生成已结束" text
     p.setPen(COL_TEXT);
     p.setFont(QFont("Microsoft YaHei", 18, QFont::Bold));
-    p.drawText(QRectF(0, content_h_ - 100, content_w_, 30), Qt::AlignCenter, QString::fromUtf8("生成已结束"));
+    p.drawText(QRectF(0, content_h_ - 100, content_w_, 30), Qt::AlignCenter,
+        !opt_success_ ? QString::fromUtf8("生成失败") : opt_stopped_
+        ? QString::fromUtf8("已停止并保存结果") : QString::fromUtf8("生成完成"));
 
     // MSE info
     p.setPen(COL_MSE_TEXT);
     p.setFont(QFont("Consolas", 12));
     p.drawText(QRectF(0, content_h_ - 70, content_w_, 20), Qt::AlignCenter,
-               QString("Final MSE: %1").arg(current_mse_, 0, 'f', 1));
+               opt_success_ ? QString("Final MSE: %1").arg(current_mse_, 0, 'f', 1) : opt_error_);
 
     // Return button
     auto dbtn = done_btn_rect();
@@ -945,6 +949,10 @@ void RenderCanvas::transition_to_running() {
     opt_running_ = true;
     opt_stopping_ = false;
 
+    opt_success_ = false;
+    opt_stopped_ = false;
+    opt_error_.clear();
+
     // Source image: already visible at config position, just stays (will be drawn at top-left in running state)
     src_image_trans_.pos_x = 0;
     src_image_trans_.pos_y = 0;
@@ -1047,20 +1055,28 @@ void RenderCanvas::on_opt_frame(QImage frame) {
     preview_image_ = frame;
 }
 
-void RenderCanvas::on_opt_finished() {
+void RenderCanvas::on_opt_finished(bool success, bool stopped, QString error) {
+    // done() is emitted just before run() returns; join before dropping ownership.
+    if (opt_worker_) opt_worker_->wait();
+    opt_success_ = success;
+    opt_stopped_ = stopped;
+    opt_error_ = error;
     opt_running_ = false;
     opt_stopping_ = false;
     opt_state_ = OptState::Done;
     opt_worker_ = nullptr; // auto-cleaned via finished->deleteLater
 
     // Async re-render preview from final JSON (mirrors best-MSE params)
-    if (!opt_output_path_.empty()) {
+    if (success && !opt_output_path_.empty()) {
         opt_preview_loading_ = true;
         std::string json_path = opt_output_path_;
         QFuture<QImage> future = QtConcurrent::run([json_path]() -> QImage {
             return RenderCanvas::render_json_preview(json_path);
         });
         opt_preview_watcher_.setFuture(future);
+    } else {
+        preview_image_ = QImage();
+        opt_preview_loading_ = false;
     }
 
     emit optimization_finished();
@@ -1151,6 +1167,7 @@ void RenderCanvas::on_inject_confirm_requested() {
 }
 
 void RenderCanvas::on_inject_finished(bool success) {
+    if (inject_worker_) inject_worker_->wait();
     inject_running_ = false;
     inject_waiting_confirm_ = false;
     on_inject_log(success ? QString::fromUtf8("注入完成") : QString::fromUtf8("注入失败"), !success);
@@ -1165,25 +1182,31 @@ QImage RenderCanvas::render_json_preview(const std::string& json_path) {
         if (shapes.empty()) return QImage();
 
         // Compute bounding box from all shapes
-        float min_x = 1e9f, min_y = 1e9f, max_x = -1e9f, max_y = -1e9f;
+        double min_x = std::numeric_limits<double>::infinity(), min_y = min_x;
+        double max_x = -min_x, max_y = -min_x;
         for (auto& s : shapes) {
             auto& d = s["data"];
-            float cx = d[0], cy = d[1], rx = d[2], ry = d[3];
-            float angle = d.size() >= 5 ? d[4].get<float>() : 0;
-            float cos_a = std::cos(angle * M_PI / 180.0f);
-            float sin_a = std::sin(angle * M_PI / 180.0f);
-            float hx = std::abs(rx * cos_a) + std::abs(ry * sin_a);
-            float hy = std::abs(rx * sin_a) + std::abs(ry * cos_a);
+            double cx = d[0], cy = d[1], rx = d[2], ry = d[3];
+            if (s["type"] == 1) { rx *= 0.5; ry *= 0.5; }
+            double angle = d.size() >= 5 ? d[4].get<double>() : 0;
+            double cos_a = std::cos(std::fmod(angle, 360.0) * M_PI / 180.0);
+            double sin_a = std::sin(std::fmod(angle, 360.0) * M_PI / 180.0);
+            double hx = std::abs(rx * cos_a) + std::abs(ry * sin_a);
+            double hy = std::abs(rx * sin_a) + std::abs(ry * cos_a);
             min_x = std::min(min_x, cx - hx);
             min_y = std::min(min_y, cy - hy);
             max_x = std::max(max_x, cx + hx);
             max_y = std::max(max_y, cy + hy);
         }
         int pad = 4;
-        int cw = std::max(1, static_cast<int>(std::ceil(max_x - min_x)) + pad * 2);
-        int ch = std::max(1, static_cast<int>(std::ceil(max_y - min_y)) + pad * 2);
-        float ox = min_x - pad;
-        float oy = min_y - pad;
+        // Bound preview allocation before converting JSON coordinates to integer dimensions.
+        double extent = std::max(max_x - min_x, max_y - min_y) + pad * 2;
+        if (!std::isfinite(extent) || extent <= 0) return QImage();
+        double preview_scale = std::min(1.0, 2048.0 / extent);
+        int cw = std::max(1, static_cast<int>(std::ceil((max_x - min_x + pad * 2) * preview_scale)));
+        int ch = std::max(1, static_cast<int>(std::ceil((max_y - min_y + pad * 2) * preview_scale)));
+        double ox = min_x - pad;
+        double oy = min_y - pad;
 
         Canvas canvas(cw, ch);
         std::vector<Shape> shape_vec;
@@ -1198,12 +1221,13 @@ QImage RenderCanvas::render_json_preview(const std::string& json_path) {
 
             Shape shape;
             shape.type = type;
-            shape.cx = data[0].get<float>() - ox;
-            shape.cy = data[1].get<float>() - oy;
-            shape.rx = data[2]; shape.ry = data[3];
-            shape.angle = data.size() >= 5 ? data[4].get<float>() : 0;
+            shape.cx = static_cast<float>((data[0].get<double>() - ox) * preview_scale);
+            shape.cy = static_cast<float>((data[1].get<double>() - oy) * preview_scale);
+            shape.rx = static_cast<float>(data[2].get<double>() * preview_scale);
+            shape.ry = static_cast<float>(data[3].get<double>() * preview_scale);
+            shape.angle = data.size() >= 5 ? static_cast<float>(std::fmod(data[4].get<double>(), 360.0)) : 0;
             shape.color = c;
-            shape.opacity = 1.0f;
+            shape.opacity = c.a / 255.0f;
             shape_vec.push_back(shape);
         }
         canvas.add_shapes(shape_vec);

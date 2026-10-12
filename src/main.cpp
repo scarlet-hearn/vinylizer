@@ -1,12 +1,7 @@
-#include <opencv2/opencv.hpp>
-#include <json.hpp>
 #include <CLI11.hpp>
 
-#include "common/types.h"
 #include "common/logger.h"
-#include "common/canvas.h"
 #include "core/pipeline.h"
-#include "output/json_writer.h"
 #include "inject/inject.h"
 
 #include <iostream>
@@ -51,44 +46,51 @@ int main(int argc, char* argv[]) {
 
     CLI11_PARSE(app, argc, argv);
 
-    if (opt_cmd->parsed()) {
-        vinylizer::PipelineConfig config;
-        config.input_path = input_path;
-        config.output_path = output_path;
-        config.num_shapes = num_shapes;
-        config.canvas_w = canvas_w;
-        config.canvas_h = canvas_h;
-        config.num_cycles = num_cycles;
+    try {
+        if (opt_cmd->parsed()) {
+            vinylizer::PipelineConfig config;
+            config.input_path = input_path;
+            config.output_path = output_path;
+            config.num_shapes = num_shapes;
+            config.canvas_w = canvas_w;
+            config.canvas_h = canvas_h;
+            config.num_cycles = num_cycles;
 
-        // Parse lr schedule
-        auto comma = lr_str.find(',');
-        if (comma != std::string::npos) {
-            config.lr_start = std::stof(lr_str.substr(0, comma));
-            config.lr_end = std::stof(lr_str.substr(comma + 1));
+            // Parse lr schedule
+            auto comma = lr_str.find(',');
+            if (comma == std::string::npos) throw std::invalid_argument("--lr must be start,end");
+            size_t used_start = 0, used_end = 0;
+            config.lr_start = std::stof(lr_str.substr(0, comma), &used_start);
+            config.lr_end = std::stof(lr_str.substr(comma + 1), &used_end);
+            if (used_start != comma || used_end != lr_str.size() - comma - 1)
+                throw std::invalid_argument("Invalid --lr values");
+
+            VIN_INFO("Starting optimization: input=%s, shapes=%d, cycles=%d",
+                     input_path.c_str(), num_shapes, num_cycles);
+
+            vinylizer::run_pipeline(config);
+
+            VIN_INFO("Optimization complete: output=%s", output_path.c_str());
+
+        } else if (inject_cmd->parsed()) {
+            vinylizer::InjectConfig config;
+            config.json_path = json_path;
+            config.process_id = pid;
+            config.layer_count = layer_count;
+
+            VIN_INFO("Injecting shapes: json=%s, pid=%d", json_path.c_str(), pid);
+
+            if (vinylizer::inject_shapes(config)) {
+                VIN_INFO("Injection successful");
+            } else {
+                VIN_ERROR("Injection failed");
+                return 1;
+            }
         }
 
-        VIN_INFO("Starting optimization: input=%s, shapes=%d, cycles=%d",
-                 input_path.c_str(), num_shapes, num_cycles);
-
-        vinylizer::run_pipeline(config);
-
-        VIN_INFO("Optimization complete: output=%s", output_path.c_str());
-
-    } else if (inject_cmd->parsed()) {
-        vinylizer::InjectConfig config;
-        config.json_path = json_path;
-        config.process_id = pid;
-        config.layer_count = layer_count;
-
-        VIN_INFO("Injecting shapes: json=%s, pid=%d", json_path.c_str(), pid);
-
-        if (vinylizer::inject_shapes(config)) {
-            VIN_INFO("Injection successful");
-        } else {
-            VIN_ERROR("Injection failed");
-            return 1;
-        }
+    } catch (const std::exception& error) {
+        VIN_ERROR("Operation failed: %s", error.what());
+        return 1;
     }
-
     return 0;
 }

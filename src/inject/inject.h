@@ -7,6 +7,7 @@
 #pragma once
 
 #include "common/types.h"
+#include "inject/shape_validation.h"
 #include <json.hpp>
 #include <string>
 #include <vector>
@@ -46,7 +47,7 @@ std::vector<nlohmann::json> validate_json(const std::string& path);
 bool inject_shapes(const InjectConfig& config);
 
 // Lower-level API
-uint64_t locate_layer_table(int pid, int layer_count);
+uint64_t locate_layer_table(int pid, int layer_count, uint64_t* group_address = nullptr);
 
 // Layer statistics
 struct LayerStats {
@@ -66,6 +67,8 @@ LayerInfo read_layer_info(int pid, uint64_t layer_ptr);
 
 // With pre-opened HANDLE (reuse across calls — for inject worker)
 bool write_layer_h(HANDLE h, uint64_t table_address, int index, const nlohmann::json& shape_data);
+bool validate_layer_table_h(HANDLE h, uint64_t table_address, int layer_count);
+bool layer_table_matches_h(HANDLE h, uint64_t group_address, uint64_t table_address, int layer_count);
 bool write_clear_layer_h(HANDLE h, uint64_t table_address, int index);
 
 } // namespace vinylizer

@@ -18,7 +18,7 @@ public:
 signals:
     void progress(float pct, float mse, int iter);
     void frame_ready(QImage frame);
-    void done();
+    void done(bool success, bool stopped, QString error);
 
 private:
     PipelineConfig config_;

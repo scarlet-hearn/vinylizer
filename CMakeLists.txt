@@ -11,9 +11,9 @@ set(CMAKE_CUDA_ARCHITECTURES 86 89 CACHE STRING "CUDA target architectures")
 
 # ── Compiler optimization flags ───────────────────────────────
 if(MSVC)
-    # CPU: fast floating-point, AVX2 (C/C++ only, not CUDA)
+    # CPU: preserve finite-value validation, plus AVX2 (C/C++ only, not CUDA)
     add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/O2>)
-    add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/fp:fast>)
+    add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/fp:precise>)
     add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/arch:AVX2>)
     add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/DNDEBUG>)
     # CUDA: fast math

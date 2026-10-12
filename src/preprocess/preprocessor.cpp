@@ -54,7 +54,7 @@ void Preprocessor::extract_alpha(const cv::Mat& input, cv::Mat& alpha,
         cv::extractChannel(input, alpha, 3);
         cv::cvtColor(input, bgr, cv::COLOR_BGRA2BGR);  // drop alpha
         cv::cvtColor(bgr, rgb, cv::COLOR_BGR2RGB);
-        cv::threshold(alpha, opaque, 127, 255, cv::THRESH_BINARY);
+        cv::threshold(alpha, opaque, 0, 255, cv::THRESH_BINARY);
     } else {
         cv::cvtColor(input, rgb, cv::COLOR_BGR2RGB);
         opaque = cv::Mat(input.rows, input.cols, CV_8UC1, cv::Scalar(255));

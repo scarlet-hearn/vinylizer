@@ -3,6 +3,8 @@
 #include "common/path_utils.h"
 #include <json.hpp>
 #include <fstream>
+#include <stdexcept>
+#include <cmath>
 
 namespace vinylizer {
 
@@ -32,13 +34,17 @@ void write_json(const std::string& path, const std::vector<Shape>& shapes,
 
     nlohmann::ordered_json payload;
     payload["shapes"] = shapes_arr;
+    payload["width"] = canvas_w;
+    payload["height"] = canvas_h;
 
     std::ofstream file = open_ofstream(path);
     if (!file.is_open()) {
-        VIN_ERROR("Failed to open JSON file for writing: %s", path.c_str());
-        return;
+        throw std::runtime_error("Cannot open JSON output: " + path);
     }
     file << payload.dump(2);
+    file.flush();
+    file.close();
+    if (!file) throw std::runtime_error("Cannot finish writing JSON output: " + path);
     VIN_INFO("Wrote %d shapes to %s", static_cast<int>(shapes_arr.size()), path.c_str());
 }
 

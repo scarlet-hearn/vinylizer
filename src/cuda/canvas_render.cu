@@ -5,6 +5,9 @@
 #include <cmath>
 
 #include "cuda/canvas_render.h"
+#include "cuda/check.h"
+#include <array>
+#include <limits>
 #include "common/types.h"
 #include "common/logger.h"
 #include "common/alpha_228.h"
@@ -83,17 +86,43 @@ __global__ void canvas_render_kernel(
 
 namespace vinylizer {
 
+struct CanvasResources {
+    cudaStream_t stream = nullptr;
+    cudaArray* array = nullptr;
+    cudaTextureObject_t texture = 0;
+    std::array<void*, 11> buffers{};
+    size_t count = 0;
+    template<class T> void allocate(T*& ptr, size_t bytes) {
+        VIN_CUDA(cudaMalloc(&ptr, bytes));
+        buffers[count++] = ptr;
+    }
+    ~CanvasResources() {
+        if (stream) cudaStreamSynchronize(stream);
+        if (texture) cudaDestroyTextureObject(texture);
+        if (array) cudaFreeArray(array);
+        for (size_t i = 0; i < count; ++i) cudaFree(buffers[i]);
+        if (stream) cudaStreamDestroy(stream);
+    }
+};
+
 cv::Mat canvas_render_gpu(const std::vector<Shape>& shapes, int w, int h) {
-    if (shapes.empty() || w <= 0 || h <= 0) {
+    if (w <= 0 || h <= 0 || static_cast<long long>(w) * h > std::numeric_limits<int>::max() / 4)
+        throw std::invalid_argument("Invalid preview dimensions");
+    if (shapes.empty()) {
         return cv::Mat::zeros(h, w, CV_8UC3);
     }
 
     int N = static_cast<int>(shapes.size());
     int total_pixels = w * h;
-    cudaStream_t stream = nullptr;
-    cudaStreamCreate(&stream);
-
     std::vector<float> h_px(total_pixels), h_py(total_pixels);
+    std::vector<float> h_cx(N), h_cy(N), h_rx(N), h_ry(N);
+    std::vector<float> h_angle(N), h_colors(N * 3), h_opacity(N);
+    std::vector<int> h_types(N);
+    std::vector<float> h_output(total_pixels * 3);
+    // Destroy GPU resources before host buffers if any CUDA operation throws.
+    CanvasResources resources;
+    VIN_CUDA(cudaStreamCreate(&resources.stream));
+    const auto stream = resources.stream;
     for (int y = 0; y < h; ++y) {
         for (int x = 0; x < w; ++x) {
             int idx = y * w + x;
@@ -103,29 +132,26 @@ cv::Mat canvas_render_gpu(const std::vector<Shape>& shapes, int w, int h) {
     }
 
     float *d_px = nullptr, *d_py = nullptr;
-    cudaMalloc(&d_px, total_pixels * sizeof(float));
-    cudaMalloc(&d_py, total_pixels * sizeof(float));
-    cudaMemcpyAsync(d_px, h_px.data(), total_pixels * sizeof(float), cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(d_py, h_py.data(), total_pixels * sizeof(float), cudaMemcpyHostToDevice, stream);
+    resources.allocate(d_px, total_pixels * sizeof(float));
+    resources.allocate(d_py, total_pixels * sizeof(float));
+    VIN_CUDA(cudaMemcpyAsync(d_px, h_px.data(), total_pixels * sizeof(float), cudaMemcpyHostToDevice, stream));
+    VIN_CUDA(cudaMemcpyAsync(d_py, h_py.data(), total_pixels * sizeof(float), cudaMemcpyHostToDevice, stream));
 
     float *d_cx = nullptr, *d_cy = nullptr, *d_rx = nullptr, *d_ry = nullptr;
     float *d_angle = nullptr, *d_colors = nullptr, *d_opacity = nullptr;
     int *d_types = nullptr;
-    cudaMalloc(&d_cx, N * sizeof(float));
-    cudaMalloc(&d_cy, N * sizeof(float));
-    cudaMalloc(&d_rx, N * sizeof(float));
-    cudaMalloc(&d_ry, N * sizeof(float));
-    cudaMalloc(&d_angle, N * sizeof(float));
-    cudaMalloc(&d_colors, N * 3 * sizeof(float));
-    cudaMalloc(&d_opacity, N * sizeof(float));
-    cudaMalloc(&d_types, N * sizeof(int));
+    resources.allocate(d_cx, N * sizeof(float));
+    resources.allocate(d_cy, N * sizeof(float));
+    resources.allocate(d_rx, N * sizeof(float));
+    resources.allocate(d_ry, N * sizeof(float));
+    resources.allocate(d_angle, N * sizeof(float));
+    resources.allocate(d_colors, N * 3 * sizeof(float));
+    resources.allocate(d_opacity, N * sizeof(float));
+    resources.allocate(d_types, N * sizeof(int));
 
     float *d_output = nullptr;
-    cudaMalloc(&d_output, total_pixels * 3 * sizeof(float));
+    resources.allocate(d_output, total_pixels * 3 * sizeof(float));
 
-    std::vector<float> h_cx(N), h_cy(N), h_rx(N), h_ry(N);
-    std::vector<float> h_angle(N), h_colors(N * 3), h_opacity(N);
-    std::vector<int> h_types(N);
     for (int i = 0; i < N; ++i) {
         const auto& s = shapes[i];
         h_cx[i] = s.cx;
@@ -140,22 +166,22 @@ cv::Mat canvas_render_gpu(const std::vector<Shape>& shapes, int w, int h) {
         h_types[i] = s.type;
     }
 
-    cudaMemcpyAsync(d_cx, h_cx.data(), N * sizeof(float), cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(d_cy, h_cy.data(), N * sizeof(float), cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(d_rx, h_rx.data(), N * sizeof(float), cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(d_ry, h_ry.data(), N * sizeof(float), cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(d_angle, h_angle.data(), N * sizeof(float), cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(d_colors, h_colors.data(), N * 3 * sizeof(float), cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(d_opacity, h_opacity.data(), N * sizeof(float), cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(d_types, h_types.data(), N * sizeof(int), cudaMemcpyHostToDevice, stream);
+    VIN_CUDA(cudaMemcpyAsync(d_cx, h_cx.data(), N * sizeof(float), cudaMemcpyHostToDevice, stream));
+    VIN_CUDA(cudaMemcpyAsync(d_cy, h_cy.data(), N * sizeof(float), cudaMemcpyHostToDevice, stream));
+    VIN_CUDA(cudaMemcpyAsync(d_rx, h_rx.data(), N * sizeof(float), cudaMemcpyHostToDevice, stream));
+    VIN_CUDA(cudaMemcpyAsync(d_ry, h_ry.data(), N * sizeof(float), cudaMemcpyHostToDevice, stream));
+    VIN_CUDA(cudaMemcpyAsync(d_angle, h_angle.data(), N * sizeof(float), cudaMemcpyHostToDevice, stream));
+    VIN_CUDA(cudaMemcpyAsync(d_colors, h_colors.data(), N * 3 * sizeof(float), cudaMemcpyHostToDevice, stream));
+    VIN_CUDA(cudaMemcpyAsync(d_opacity, h_opacity.data(), N * sizeof(float), cudaMemcpyHostToDevice, stream));
+    VIN_CUDA(cudaMemcpyAsync(d_types, h_types.data(), N * sizeof(int), cudaMemcpyHostToDevice, stream));
 
     // Alpha LUT texture (from shared LUT)
     const auto& shared_lut = alpha_228_lut();
 
     cudaChannelFormatDesc desc = cudaCreateChannelDesc<float>();
-    cudaArray* alpha_array = nullptr;
-    cudaMallocArray(&alpha_array, &desc, ALPHA_LUT_SIZE, 1);
-    cudaMemcpyToArray(alpha_array, 0, 0, shared_lut.data(), ALPHA_LUT_SIZE * sizeof(float), cudaMemcpyHostToDevice);
+    auto& alpha_array = resources.array;
+    VIN_CUDA(cudaMallocArray(&alpha_array, &desc, ALPHA_LUT_SIZE, 1));
+    VIN_CUDA(cudaMemcpyToArray(alpha_array, 0, 0, shared_lut.data(), ALPHA_LUT_SIZE * sizeof(float), cudaMemcpyHostToDevice));
 
     cudaResourceDesc resDesc = {};
     resDesc.resType = cudaResourceTypeArray;
@@ -167,8 +193,8 @@ cv::Mat canvas_render_gpu(const std::vector<Shape>& shapes, int w, int h) {
     texDesc.readMode = cudaReadModeElementType;
     texDesc.normalizedCoords = 1;
 
-    cudaTextureObject_t alpha_tex = 0;
-    cudaCreateTextureObject(&alpha_tex, &resDesc, &texDesc, nullptr);
+    auto& alpha_tex = resources.texture;
+    VIN_CUDA(cudaCreateTextureObject(&alpha_tex, &resDesc, &texDesc, nullptr));
 
     int threads = 256;
     int blocks = (total_pixels + threads - 1) / threads;
@@ -177,9 +203,9 @@ cv::Mat canvas_render_gpu(const std::vector<Shape>& shapes, int w, int h) {
         d_colors, d_opacity, d_types, d_output,
         N, total_pixels, alpha_tex);
 
-    std::vector<float> h_output(total_pixels * 3);
-    cudaMemcpyAsync(h_output.data(), d_output, total_pixels * 3 * sizeof(float), cudaMemcpyDeviceToHost, stream);
-    cudaStreamSynchronize(stream);
+    VIN_CUDA(cudaGetLastError());
+    VIN_CUDA(cudaMemcpyAsync(h_output.data(), d_output, total_pixels * 3 * sizeof(float), cudaMemcpyDeviceToHost, stream));
+    VIN_CUDA(cudaStreamSynchronize(stream));
 
     cv::Mat result(h, w, CV_8UC3);
     for (int y = 0; y < h; ++y) {
@@ -192,16 +218,6 @@ cv::Mat canvas_render_gpu(const std::vector<Shape>& shapes, int w, int h) {
             );
         }
     }
-
-    cudaDestroyTextureObject(alpha_tex);
-    cudaFreeArray(alpha_array);
-    cudaFree(d_output);
-    cudaFree(d_types);
-    cudaFree(d_opacity); cudaFree(d_colors);
-    cudaFree(d_angle);
-    cudaFree(d_ry); cudaFree(d_rx); cudaFree(d_cy); cudaFree(d_cx);
-    cudaFree(d_py); cudaFree(d_px);
-    cudaStreamDestroy(stream);
 
     return result;
 }
