@@ -44,6 +44,7 @@ set(COMMON_SOURCES
 
 set(PREPROCESS_SOURCES
     src/preprocess/preprocessor.cpp
+    src/preprocess/facial_saliency.cpp
 )
 
 set(CORE_SOURCES
@@ -148,5 +149,17 @@ else()
     )
 endif()
 
-# ── Test executable ───────────────────────────────────────────
-# Removed — test_verify.cpp deleted during code simplification
+# Ship the detectors for both entry points, independent of OpenCV sample paths.
+add_custom_command(TARGET vinylizer POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_SOURCE_DIR}/assets/haarcascades"
+        "$<TARGET_FILE_DIR:vinylizer>/assets/haarcascades"
+    VERBATIM
+)
+
+# Focused CPU regression tests can also be built separately with -S tests.
+option(VINYLIZER_BUILD_TESTS "Build facial weighting regression tests" OFF)
+if(VINYLIZER_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()

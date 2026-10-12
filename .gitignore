@@ -1,6 +1,7 @@
 # 构建目录
 build/
 build-gui/
+build-tests/
 
 # IDE
 .vscode/

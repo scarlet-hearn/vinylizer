@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common/types.h"
+#include "preprocess/facial_saliency.h"
 #include <opencv2/core.hpp>
 #include <vector>
 #include <tuple>
@@ -29,11 +30,13 @@ struct PreprocessResult {
 class Preprocessor {
 public:
     void set_kmeans_k(int k) { kmeans_k_ = k; }
+    void set_facial_saliency_config(const FacialSaliencyConfig& config) { facial_saliency_config_ = config; }
 
     PreprocessResult process(const cv::Mat& input_img);
 
 private:
     int kmeans_k_ = 0;
+    FacialSaliencyConfig facial_saliency_config_;
 
     void extract_alpha(const cv::Mat& input, cv::Mat& alpha,
                        cv::Mat& rgb, cv::Mat& opaque);

@@ -1,5 +1,36 @@
 导入部分代码来自BvzRays/forza-painter-fh6
 
+## 人脸、眼睛与嘴部加权
+
+GUI 和 CLI 默认启用五官加权。权重同时用于图形初始化、CUDA 的 RGB 拟合误差与梯度，以及重定位的误差评分。高权重区域使用更小的初始图形和取色窗口，重定位时直接读取局部颜色，减少调色板合并对眼睛和唇部细节的影响。
+
+| 区域 | 默认相对峰值权重 |
+| --- | ---: |
+| 背景 | 1 |
+| 人脸 | 3 |
+| 检测到的眼睛 | 12 |
+| 微笑模型辅助定位的嘴部 | 10 |
+| 人脸内推测的眼睛区域（漏检时） | 7 |
+| 人脸内推测的嘴部区域（漏检时） | 6 |
+
+区域边缘平滑衰减，重叠取最大值；权重上限为 15。RGB 损失权重在不透明像素上归一化到均值 1，Alpha 损失保持原样。界面和日志中的 MSE 现在包含五官权重，因此不宜直接与旧版本的普通 MSE 比较。图层总数不因加权增加。
+
+检测使用随项目附带的 OpenCV Haar 模型，构建后自动复制到程序旁的 `assets/haarcascades/`，分发时需保留该目录。也会依次查找 `VINYLIZER_CASCADE_DIR`、工作目录的 `assets/haarcascades/` 和 OpenCV sample 路径。模型来源及原始许可见 [模型说明](assets/haarcascades/README.md)。
+
+眼睛只在人脸上半区检测，嘴部使用下半区的微笑检测结果辅助定位；微笑检测不等同于通用嘴部检测，普通表情使用较弱的位置先验。未检测到人脸时返回中性权重；缺少人脸模型会记录警告。侧脸、大角度旋转和动漫脸仍可能漏检。默认数值可以在 `src/preprocess/facial_saliency.h` 的 `FacialSaliencyConfig` 中调整，或通过 `Preprocessor::set_facial_saliency_config()` 配置。
+
+### 加权回归测试
+
+已提供不依赖 CUDA 的 CPU 测试入口，验证平滑区域、五官漏检补偿、权重归一化、模型加载及损失梯度：
+
+```powershell
+cmake -S tests -B build-tests -DOpenCV_DIR="<OpenCVConfig.cmake 所在目录>"
+cmake --build build-tests --config Release
+ctest --test-dir build-tests -C Release --output-on-failure
+```
+
+运行时需让 OpenCV DLL 所在目录可被找到。仅验证生产损失公式时，可以使用 `-DVINYLIZER_TEST_OPENCV=OFF`，或直接用 C++17 编译器编译 `tests/pixel_loss_test.cpp`（添加 `src` 头文件目录）。完整程序构建可通过 `-DVINYLIZER_BUILD_TESTS=ON` 启用同一组测试。数值测试不替代实际图片上的 CUDA 拟合效果对比。
+
 ## 2026/6/26 v0.1.1
 - 源码已上传，已经力竭了，尽力让他不那么乱
 - 透明背景现在表现正常了

@@ -94,6 +94,9 @@ struct RenderScratch {
     // Mask [total_pixels] (1.0f for opaque, 0.0f for transparent)
     float* d_mask = nullptr;
 
+    // RGB loss importance [total_pixels], normalized over opaque pixels
+    float* d_rgb_weights = nullptr;
+
     // Target alpha [total_pixels] (255.0f for opaque, 0.0f for transparent)
     float* d_target_alpha = nullptr;
 
@@ -140,7 +143,10 @@ public:
     DiffRenderer& operator=(const DiffRenderer&) = delete;
 
     void init(int canvas_w, int canvas_h, int max_shapes);
-    void set_target(const float* h_target, const float* h_mask, const float* h_target_alpha);
+    // Optional RGB weights must be finite, nonnegative, and mean one over
+    // opaque pixels. nullptr restores uniform weighting; alpha is unweighted.
+    void set_target(const float* h_target, const float* h_mask, const float* h_target_alpha,
+                    const float* h_rgb_weights = nullptr);
     void set_bg_color(float r, float g, float b);
 
     // Compute per-shape visibility (blend weight sum on GPU)

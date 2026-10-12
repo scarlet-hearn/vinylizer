@@ -112,6 +112,7 @@ private:
     float scale_ = 1.0f;
     int H_opt_ = 0, W_opt_ = 0;
     cv::Mat target_small_, mask_small_;
+    cv::Mat saliency_small_, rgb_loss_weights_;
 
     // Renderer
     DiffRenderer renderer_;

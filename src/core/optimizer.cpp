@@ -1,4 +1,5 @@
 #include "core/optimizer.h"
+#include "core/saliency_weights.h"
 #include "common/logger.h"
 #include "common/canvas.h"
 
@@ -76,6 +77,10 @@ std::vector<Shape> GradientOptimizer::optimize(
     cv::resize(mask_u8, mask_small_, {W_opt_, H_opt_}, 0, 0, cv::INTER_NEAREST);
     mask_small_ = mask_small_ > 127;
 
+    auto facial_weights = build_saliency_weights(saliency_map_, mask_small_);
+    saliency_small_ = facial_weights.priority;
+    rgb_loss_weights_ = facial_weights.rgb_loss;
+
     // Resize posterized
     if (!posterized.empty()) {
         cv::resize(posterized, posterized_small_, {W_opt_, H_opt_}, 0, 0, cv::INTER_NEAREST);
@@ -109,7 +114,8 @@ std::vector<Shape> GradientOptimizer::optimize(
             h_target_alpha[idx] = opaque ? 255.0f : 0.0f;
         }
     }
-    renderer_.set_target(h_target.data(), h_mask_gpu.data(), h_target_alpha.data());
+    renderer_.set_target(h_target.data(), h_mask_gpu.data(), h_target_alpha.data(),
+                         rgb_loss_weights_.ptr<float>());
 
     // Initialize shapes
     initialize_shapes();
@@ -137,13 +143,7 @@ cv::Mat GradientOptimizer::build_importance_map() {
         importance = importance.mul(weighted);
     }
 
-    if (!saliency_map_.empty()) {
-        cv::Mat sal_small;
-        cv::resize(saliency_map_, sal_small, {W_opt_, H_opt_}, 0, 0, cv::INTER_LINEAR);
-        cv::Mat clamped;
-        cv::min(cv::max(sal_small, 0.5), 15.0, clamped);
-        importance = importance.mul(clamped);
-    }
+    importance = importance.mul(saliency_small_);
 
     if (!dark_mask_.empty()) {
         cv::Mat dark_small;
@@ -185,8 +185,9 @@ void GradientOptimizer::initialize_shapes() {
             int y = idx / W_opt_, x = idx % W_opt_;
             params_.cx[i] = static_cast<float>(x);
             params_.cy[i] = static_cast<float>(y);
-            params_.rx[i] = dist_size(rng_);
-            params_.ry[i] = dist_size(rng_);
+            float detail_scale = saliency_radius_scale(saliency_small_.at<float>(y, x));
+            params_.rx[i] = std::max(1.0f, dist_size(rng_) * detail_scale);
+            params_.ry[i] = std::max(1.0f, dist_size(rng_) * detail_scale);
             params_.angle[i] = dist_angle(rng_);
             auto [r, g, b] = get_local_color(static_cast<float>(x), static_cast<float>(y));
             params_.color_r[i] = r;
@@ -200,7 +201,10 @@ void GradientOptimizer::initialize_shapes() {
 }
 
 std::tuple<int,int,int> GradientOptimizer::get_local_color(float x, float y) {
-    int r = 5;
+    int xi = std::clamp(static_cast<int>(x), 0, W_opt_ - 1);
+    int yi = std::clamp(static_cast<int>(y), 0, H_opt_ - 1);
+    int r = std::max(1, static_cast<int>(std::lround(
+        5.0f * saliency_radius_scale(saliency_small_.at<float>(yi, xi)))));
     int x0 = std::max(0, static_cast<int>(x) - r);
     int x1 = std::min(W_opt_, static_cast<int>(x) + r + 1);
     int y0 = std::max(0, static_cast<int>(y) - r);
@@ -595,7 +599,7 @@ std::vector<int> GradientOptimizer::relocate_shapes(OptParams& params,
     std::vector<float> rendered(total_pixels * 3);
     renderer_.download_output(rendered.data());
 
-    // Compute error map on CPU
+    // Match the weighted RGB objective, so relocation keeps prioritizing features.
     cv::Mat error_map = cv::Mat::zeros(H_opt_, W_opt_, CV_32FC1);
     for (int y = 0; y < H_opt_; ++y) {
         for (int x = 0; x < W_opt_; ++x) {
@@ -605,7 +609,8 @@ std::vector<int> GradientOptimizer::relocate_shapes(OptParams& params,
             float dr = rendered[idx * 3 + 0] - tc[0];
             float dg = rendered[idx * 3 + 1] - tc[1];
             float db = rendered[idx * 3 + 2] - tc[2];
-            error_map.at<float>(y, x) = dr * dr + dg * dg + db * db;
+            error_map.at<float>(y, x) = (dr * dr + dg * dg + db * db)
+                                      * rgb_loss_weights_.at<float>(y, x);
         }
     }
 
@@ -632,12 +637,16 @@ std::vector<int> GradientOptimizer::relocate_shapes(OptParams& params,
 
         nc_x[j] = static_cast<float>(new_x);
         nc_y[j] = static_cast<float>(new_y);
-        nr_x[j] = dist_size(rng_);
-        nr_y[j] = dist_size(rng_);
+        float priority = saliency_small_.at<float>(new_y, new_x);
+        float detail_scale = saliency_radius_scale(priority);
+        nr_x[j] = std::max(1.0f, dist_size(rng_) * detail_scale);
+        nr_y[j] = std::max(1.0f, dist_size(rng_) * detail_scale);
         na_ng[j] = dist_angle(rng_);
         nc_a[j] = 255.0f;
 
-        auto [r, g, b] = get_posterized_color(new_x, new_y);
+        // Preserve small eye/lip color differences that palette merging can erase.
+        auto [r, g, b] = priority > 1.0f
+            ? get_local_color(new_x, new_y) : get_posterized_color(new_x, new_y);
         nc_r[j] = r; nc_g[j] = g; nc_b[j] = b;
     }
 

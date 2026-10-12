@@ -1,4 +1,5 @@
 #include "core/diff_renderer.h"
+#include "core/pixel_loss.cuh"
 #include "common/logger.h"
 #include "common/alpha_228.h"
 
@@ -141,6 +142,7 @@ __global__ void mse_grad_kernel(
     const float* __restrict__ output,     // [C, 3]
     const float* __restrict__ target,     // [C, 3]
     const float* __restrict__ mask,       // [C]
+    const float* __restrict__ rgb_weights, // [C], mean one on opaque pixels
     float* __restrict__ grad_output,      // [C, 3]
     float* __restrict__ mse_sum,          // [1] atomic result
     int C,
@@ -151,33 +153,23 @@ __global__ void mse_grad_kernel(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= C) return;
 
-    float m = mask[idx];
+    const bool has_alpha = rendered_alpha && target_alpha && grad_alpha;
+    const float alpha_difference = has_alpha ? rendered_alpha[idx] - target_alpha[idx] : 0.0f;
+    const auto loss = vinylizer::evaluate_pixel_loss(
+        output + idx * 3, target + idx * 3, mask[idx], rgb_weights[idx],
+        alpha_difference, C);
 
-    // RGB gradient: masked (transparent pixels have no meaningful RGB target)
-    if (m < 0.5f) {
-        grad_output[idx * 3 + 0] = 0.0f;
-        grad_output[idx * 3 + 1] = 0.0f;
-        grad_output[idx * 3 + 2] = 0.0f;
-    } else {
-        float dr = output[idx * 3 + 0] - target[idx * 3 + 0];
-        float dg = output[idx * 3 + 1] - target[idx * 3 + 1];
-        float db = output[idx * 3 + 2] - target[idx * 3 + 2];
-
-        float sq_err = dr * dr + dg * dg + db * db;
-        atomicAdd(mse_sum, sq_err);
-
-        float scale = 2.0f / (C * 4.0f);  // 4 channels (RGBA)
-        grad_output[idx * 3 + 0] = dr * scale;
-        grad_output[idx * 3 + 1] = dg * scale;
-        grad_output[idx * 3 + 2] = db * scale;
+    grad_output[idx * 3 + 0] = loss.grad_rgb[0];
+    grad_output[idx * 3 + 1] = loss.grad_rgb[1];
+    grad_output[idx * 3 + 2] = loss.grad_rgb[2];
+    if (mask[idx] >= 0.5f) {
+        atomicAdd(mse_sum, loss.rgb_squared_error);
     }
 
     // Alpha gradient: always computed (not masked by opaque mask)
-    if (rendered_alpha && target_alpha && grad_alpha) {
-        float da = rendered_alpha[idx] - target_alpha[idx];
-        atomicAdd(mse_sum, da * da);
-        float scale = 2.0f / (C * 4.0f);  // same scale as RGB
-        grad_alpha[idx] = da * scale;
+    if (has_alpha) {
+        atomicAdd(mse_sum, loss.alpha_squared_error);
+        grad_alpha[idx] = loss.grad_alpha;
     } else if (grad_alpha) {
         grad_alpha[idx] = 0.0f;
     }
@@ -407,7 +399,7 @@ DiffRenderer::~DiffRenderer() {
     cudaFree(s.d_active_indices);
     cudaFree(s.d_active_indices_per_tile);
     cudaFree(s.d_active_count_per_tile);
-    cudaFree(s.d_target); cudaFree(s.d_mask);
+    cudaFree(s.d_target); cudaFree(s.d_mask); cudaFree(s.d_rgb_weights);
     cudaFree(s.d_target_alpha); cudaFree(s.d_rendered_alpha); cudaFree(s.d_grad_alpha);
     cudaFree(s.d_visibility);
     cudaFree(s.d_canvas_u8);
@@ -554,6 +546,7 @@ void DiffRenderer::init(int canvas_w, int canvas_h, int max_shapes) {
     // Target and mask
     CUDA_CHECK(cudaMalloc(&s.d_target, s.total_pixels * 3 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&s.d_mask, s.total_pixels * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&s.d_rgb_weights, s.total_pixels * sizeof(float)));
 
     // Target alpha, rendered alpha, and alpha gradient
     CUDA_CHECK(cudaMalloc(&s.d_target_alpha, s.total_pixels * sizeof(float)));
@@ -644,10 +637,18 @@ void DiffRenderer::init(int canvas_w, int canvas_h, int max_shapes) {
              canvas_w, canvas_h, max_shapes, s.tile_pixels);
 }
 
-void DiffRenderer::set_target(const float* h_target, const float* h_mask, const float* h_target_alpha) {
+void DiffRenderer::set_target(const float* h_target, const float* h_mask, const float* h_target_alpha,
+                              const float* h_rgb_weights) {
     auto& s = scratch_;
     CUDA_CHECK(cudaMemcpy(s.d_target, h_target, s.total_pixels * 3 * sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(s.d_mask, h_mask, s.total_pixels * sizeof(float), cudaMemcpyHostToDevice));
+    if (h_rgb_weights) {
+        CUDA_CHECK(cudaMemcpy(s.d_rgb_weights, h_rgb_weights, s.total_pixels * sizeof(float), cudaMemcpyHostToDevice));
+    } else {
+        // Reset explicitly so a later unweighted target cannot reuse old weights.
+        std::vector<float> weights(s.total_pixels, 1.0f);
+        CUDA_CHECK(cudaMemcpy(s.d_rgb_weights, weights.data(), s.total_pixels * sizeof(float), cudaMemcpyHostToDevice));
+    }
     if (h_target_alpha) {
         CUDA_CHECK(cudaMemcpy(s.d_target_alpha, h_target_alpha, s.total_pixels * sizeof(float), cudaMemcpyHostToDevice));
     } else {
@@ -735,7 +736,7 @@ float DiffRenderer::compute_mse_and_grad(int N) {
     int threads = 256;
     int blocks = (s.total_pixels + threads - 1) / threads;
     mse_grad_kernel<<<blocks, threads, 0, s.stream>>>(
-        s.d_output, s.d_target, s.d_mask,
+        s.d_output, s.d_target, s.d_mask, s.d_rgb_weights,
         s.d_grad_output, s.d_mse_sum, s.total_pixels,
         s.d_rendered_alpha, s.d_target_alpha, s.d_grad_alpha);
     CUDA_KERNEL_CHECK();

@@ -2,8 +2,6 @@
 #include "common/logger.h"
 
 #include <opencv2/imgproc.hpp>
-#include <opencv2/objdetect.hpp>
-#include <opencv2/core/utility.hpp>
 
 #include <algorithm>
 #include <unordered_set>
@@ -279,31 +277,7 @@ cv::Mat Preprocessor::detect_edges(const cv::Mat& rgb) {
 
 // ── compute_saliency ─────────────────────────────────────────
 cv::Mat Preprocessor::compute_saliency(const cv::Mat& rgb) {
-    cv::Mat saliency(rgb.rows, rgb.cols, CV_32FC1, cv::Scalar(1.0f));
-    cv::Mat gray;
-    cv::cvtColor(rgb, gray, cv::COLOR_RGB2GRAY);
-
-    cv::CascadeClassifier face_cascade, eye_cascade;
-    std::string face_path = cv::samples::findFile("haarcascade_frontalface_default.xml", false, false);
-    std::string eye_path  = cv::samples::findFile("haarcascade_eye.xml", false, false);
-
-    if (!face_path.empty() && face_cascade.load(face_path)) {
-        std::vector<cv::Rect> faces;
-        face_cascade.detectMultiScale(gray, faces, 1.1, 3, 0, cv::Size(30, 30));
-        for (const auto& f : faces) {
-            saliency(f).setTo(3.0f);
-        }
-    }
-
-    if (!eye_path.empty() && eye_cascade.load(eye_path)) {
-        std::vector<cv::Rect> eyes;
-        eye_cascade.detectMultiScale(gray, eyes, 1.1, 3, 0, cv::Size(20, 20));
-        for (const auto& e : eyes) {
-            saliency(e).setTo(10.0f);
-        }
-    }
-
-    return saliency;
+    return compute_facial_saliency(rgb, facial_saliency_config_);
 }
 
 // ── extract_dark_pixels ──────────────────────────────────────
@@ -320,6 +294,11 @@ cv::Mat Preprocessor::extract_dark_pixels(const cv::Mat& rgb) {
 PreprocessResult Preprocessor::process(const cv::Mat& input_img) {
     VIN_INFO("Preprocessing...");
     PreprocessResult result;
+
+    if (input_img.empty()) {
+        VIN_WARN("Preprocessing skipped: empty input image");
+        return result;
+    }
 
     extract_alpha(input_img, result.alpha_mask, result.rgb_image, result.opaque_mask);
 
