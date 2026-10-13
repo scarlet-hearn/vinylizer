@@ -2,6 +2,10 @@ cmake_minimum_required(VERSION 3.22)
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     project(vinylizer-facial-tests LANGUAGES CXX)
     enable_testing()
+    if(MSVC)
+        add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/utf-8>)
+        add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
+    endif()
 endif()
 
 get_filename_component(VINYLIZER_ROOT "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
@@ -9,6 +13,26 @@ add_executable(pixel_loss_test pixel_loss_test.cpp)
 target_compile_features(pixel_loss_test PRIVATE cxx_std_17)
 target_include_directories(pixel_loss_test PRIVATE "${VINYLIZER_ROOT}/src")
 add_test(NAME pixel_loss COMMAND pixel_loss_test)
+
+add_executable(fitting_math_test fitting_math_test.cpp)
+target_compile_features(fitting_math_test PRIVATE cxx_std_17)
+target_include_directories(fitting_math_test PRIVATE "${VINYLIZER_ROOT}/src")
+add_test(NAME fitting_math COMMAND fitting_math_test)
+
+option(VINYLIZER_TEST_CUDA "Test real renderer gradients on a CUDA device" OFF)
+if(VINYLIZER_TEST_CUDA)
+    enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    add_executable(renderer_gradient_test renderer_gradient_test.cu
+        "${VINYLIZER_ROOT}/src/core/diff_renderer.cu"
+        "${VINYLIZER_ROOT}/src/cuda/render_kernel.cu")
+    set_target_properties(renderer_gradient_test PROPERTIES
+        CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON CUDA_SEPARABLE_COMPILATION ON)
+    target_include_directories(renderer_gradient_test PRIVATE "${VINYLIZER_ROOT}/src")
+    target_link_libraries(renderer_gradient_test PRIVATE CUDA::cudart)
+    add_test(NAME renderer_gradient COMMAND renderer_gradient_test)
+    set_tests_properties(renderer_gradient PROPERTIES SKIP_RETURN_CODE 77)
+endif()
 
 if(WIN32)
     add_executable(safety_test safety_test.cpp

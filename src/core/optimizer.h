@@ -28,7 +28,7 @@ struct OptimizerConfig {
     int reloc_cycle_local = 50;
     int reloc_stability_window = 50;
     float reloc_stability_threshold = 0.10f;
-    float reloc_useless_threshold = 0.01f;
+    float reloc_max_fraction = 0.05f; // Replace at most 5% of layers per cycle.
 };
 
 // Optimizer parameters (SoA layout for GPU transfer)
@@ -88,21 +88,15 @@ private:
     void gradient_optimize();
     void capture_best(float mse);
     bool should_stop() const { return stop_requested_ || (external_stop_ && external_stop_->load()); }
-    float run_single_iter(OptParams& params,
-                          std::vector<float>& grads, int iter, int total_iters,
-                          float* d_grad_history = nullptr, int write_idx = 0,
-                          bool local_phase = false,
-                          const std::vector<int>& frozen_indices = {});
+    float run_single_iter(int iter, float* d_grad_history = nullptr, int write_idx = 0);
+    void publish_progress(float mse, int completed_iters);
 
     // Cyclic Relocation
-    void find_relocation_candidates(const std::vector<float>& grads,
-                                    const std::vector<float>& visibility,
+    void find_relocation_candidates(const std::vector<float>& visibility,
                                     std::vector<int>& candidates,
                                     int& n_useful, int& n_useless, int& n_unstable);
     std::vector<int> relocate_shapes(OptParams& params,
                                        const std::vector<int>& indices);
-    float run_local_phase(OptParams& params,
-                          const std::vector<int>& reloc_indices, int num_iters);
 
     // Utility
     std::tuple<int,int,int> get_local_color(float x, float y);
@@ -117,7 +111,7 @@ private:
     float scale_ = 1.0f;
     int H_opt_ = 0, W_opt_ = 0;
     cv::Mat target_small_, mask_small_;
-    cv::Mat loss_target_small_;
+    cv::Mat loss_target_small_, target_alpha_small_;
     cv::Mat saliency_small_, rgb_loss_weights_;
 
     // Renderer
@@ -140,7 +134,6 @@ private:
 
     // Relocation state
     int reloc_total_ = 0;
-    bool reloc_converged_ = false;
 
     // Best evaluated parameter state (captured before the corresponding Adam update)
     float best_mse_ = 1e20f;

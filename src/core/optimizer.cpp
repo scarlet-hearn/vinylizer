@@ -1,6 +1,7 @@
 #include "core/optimizer.h"
 #include "core/saliency_weights.h"
 #include "core/alpha_target.h"
+#include "core/residual_placement.h"
 #include "cuda/check.h"
 #include "common/logger.h"
 #include "common/canvas.h"
@@ -139,6 +140,7 @@ std::vector<Shape> GradientOptimizer::optimize(
     renderer_.set_target(h_target.data(), h_mask_gpu.data(), h_target_alpha.data(),
                          rgb_loss_weights_.ptr<float>());
     loss_target_small_ = cv::Mat(H_opt_, W_opt_, CV_32FC3, h_target.data()).clone();
+    target_alpha_small_ = cv::Mat(H_opt_, W_opt_, CV_32FC1, h_target_alpha.data()).clone();
 
     // Initialize shapes
     initialize_shapes();
@@ -256,27 +258,16 @@ std::tuple<int,int,int> GradientOptimizer::get_posterized_color(float x, float y
 // Single iteration
 // ================================================================
 
-float GradientOptimizer::run_single_iter(
-    OptParams& params,
-    std::vector<float>& grads, int iter, int total_iters,
-    float* d_grad_history, int write_idx,
-    bool local_phase, const std::vector<int>& frozen_indices)
+float GradientOptimizer::run_single_iter(int iter, float* d_grad_history, int write_idx)
 {
-    int N = params.N;
+    int N = params_.N;
 
     // Forward + backward on GPU (optionally writes gradient norms to history)
     float mse = renderer_.render_forward_backward(N, d_grad_history, write_idx);
     capture_best(mse);
 
-    // Update frozen mask on GPU
-    if (!frozen_indices.empty()) {
-        std::vector<int> frozen_mask(N, 0);
-        for (int i : frozen_indices) frozen_mask[i] = 1;
-        renderer_.set_frozen_mask(frozen_mask.data(), N);
-    }
-
     // Learning rate schedule (cosine)
-    float progress = static_cast<float>(iter) / std::max(total_iters - 1, 1);
+    float progress = static_cast<float>(iter) / std::max(config_.total_iters - 1, 1);
     float lr = config_.lr_end + (config_.lr_start - config_.lr_end) *
                0.5f * (1.0f + std::cos(static_cast<float>(M_PI) * progress));
 
@@ -288,6 +279,21 @@ float GradientOptimizer::run_single_iter(
         W_opt_, H_opt_);
 
     return mse;
+}
+
+void GradientOptimizer::publish_progress(float mse, int completed_iters) {
+    if (!viz_first_frame_) {
+        VIN_CUDA(cudaEventSynchronize(viz_event_));
+        cv::Mat frame(H_opt_, W_opt_, CV_8UC3, viz_pinned_);
+        std::lock_guard<std::mutex> lock(viz_mutex_);
+        const int index = viz_write_idx_.load();
+        canvas_rgb_[index] = frame.clone();
+        viz_write_idx_.store(1 - index);
+    }
+    renderer_.async_copy_canvas(viz_pinned_, viz_event_);
+    viz_first_frame_ = false;
+    if (progress_cb_) progress_cb_(static_cast<float>(completed_iters) / config_.total_iters,
+                                   mse, completed_iters);
 }
 
 // ================================================================
@@ -309,11 +315,10 @@ void GradientOptimizer::gradient_optimize() {
     const int cycle_global = config_.reloc_cycle_global;
     const int cycle_local = config_.reloc_cycle_local;
     const int window = config_.reloc_stability_window;
-    if (cycle_global <= 0 || cycle_local < 0 || window <= 0
-        || config_.total_iters < cycle_global + cycle_local)
+    if (cycle_global <= 0 || cycle_local < 0 || window <= 0 || config_.total_iters <= 0
+        || !std::isfinite(config_.reloc_max_fraction) || config_.reloc_max_fraction <= 0.0f
+        || config_.reloc_max_fraction > 1.0f)
         throw std::invalid_argument("Invalid optimization cycle configuration");
-    const int num_cycles = config_.total_iters / (cycle_global + cycle_local);
-    const int total_global_iters = num_cycles * cycle_global;
 
     VIN_CUDA(cudaMalloc(&d_grad_history_, static_cast<size_t>(window) * N * sizeof(float)));
     VIN_CUDA(cudaMemset(d_grad_history_, 0, static_cast<size_t>(window) * N * sizeof(float)));
@@ -321,60 +326,77 @@ void GradientOptimizer::gradient_optimize() {
     VIN_CUDA(cudaEventCreate(&viz_event_));
     VIN_CUDA(cudaMallocHost(&snap_pinned_, static_cast<size_t>(N) * 9 * sizeof(float)));
     VIN_CUDA(cudaEventCreate(&snap_event_));
-    history_write_idx_ = history_count_ = reloc_total_ = 0;
-    reloc_converged_ = false;
+    adam_step_ = history_write_idx_ = history_count_ = reloc_total_ = 0;
     viz_first_frame_ = true;
     has_best_ = false;
     best_mse_ = 1e20f;
     renderer_.upload_params_gpu(params_.to_shape_params().data(), N);
-    std::vector<float> grads(N * 9, 0.0f);
-    int global_iter = 0;
+    int completed_iters = 0, cycle = 0;
 
-    for (int cycle = 0; cycle < num_cycles && !should_stop(); ++cycle) {
-        for (int gi = 0; gi < cycle_global && !should_stop(); ++gi) {
-            if (!viz_first_frame_) {
-                VIN_CUDA(cudaEventSynchronize(viz_event_));
-                cv::Mat frame(H_opt_, W_opt_, CV_8UC3, viz_pinned_);
-                std::lock_guard<std::mutex> lock(viz_mutex_);
-                const int index = viz_write_idx_.load();
-                canvas_rgb_[index] = frame.clone(); // Own pixels, never alias the next DMA destination.
-                viz_write_idx_.store(1 - index);
-            }
-            const float mse = run_single_iter(params_, grads, global_iter, total_global_iters,
-                                               d_grad_history_, history_write_idx_);
-            renderer_.async_copy_canvas(viz_pinned_, viz_event_);
-            viz_first_frame_ = false;
-            history_write_idx_ = (history_write_idx_ + 1) % window;
-            history_count_ = std::min(history_count_ + 1, window);
-            ++global_iter;
-            if (progress_cb_) progress_cb_(static_cast<float>(global_iter) / total_global_iters, mse, global_iter);
-        }
+    auto global_step = [&] {
+        const float mse = run_single_iter(completed_iters, d_grad_history_, history_write_idx_);
+        history_write_idx_ = (history_write_idx_ + 1) % window;
+        history_count_ = std::min(history_count_ + 1, window);
+        publish_progress(mse, ++completed_iters);
+    };
+    while (completed_iters < config_.total_iters && !should_stop()) {
+        ++cycle;
+        for (int gi = 0; gi < cycle_global && completed_iters < config_.total_iters && !should_stop(); ++gi)
+            global_step();
         if (should_stop()) break;
-        const bool last_cycle = cycle == num_cycles - 1;
-        std::vector<int> candidates;
-        int useful = 0, useless = 0, unstable = 0;
-        if (!reloc_converged_ && !last_cycle) {
-            // Refresh output/gradients after the most recent Adam step.
-            capture_best(renderer_.render_forward_backward(N));
-            renderer_.download_grads_packed(grads.data(), N);
+        const int local_iters = std::min(cycle_local, config_.total_iters - completed_iters);
+        const bool last_cycle = config_.total_iters - completed_iters <= cycle_local;
+        std::vector<int> candidates, indices;
+        OptParams before_relocation;
+        float previous_mse = 0.0f;
+        if (!last_cycle && local_iters > 0) {
+            // Refresh output and visibility at the same, post-update parameters.
+            previous_mse = renderer_.render_forward_backward(N);
+            capture_best(previous_mse);
             renderer_.compute_visibility(N);
             std::vector<float> visibility(N);
             renderer_.download_visibility(visibility.data(), N);
             auto shapes = params_.to_shape_params();
             renderer_.download_params_gpu(shapes.data(), N);
             for (int i = 0; i < N; ++i) params_.set_shape(i, shapes[i]);
-            find_relocation_candidates(grads, visibility, candidates, useful, useless, unstable);
+            int useful = 0, useless = 0, unstable = 0;
+            find_relocation_candidates(visibility, candidates, useful, useless, unstable);
+            if (!candidates.empty()) {
+                before_relocation = params_;
+                indices = relocate_shapes(params_, candidates);
+            }
         }
-        if (!candidates.empty()) {
-            auto indices = relocate_shapes(params_, candidates);
+        if (!indices.empty()) {
             renderer_.upload_params_gpu(params_.to_shape_params().data(), N);
             renderer_.reset_adam_state_all_gpu(N);
             adam_step_ = history_write_idx_ = history_count_ = 0;
-            run_local_phase(params_, indices, cycle_local);
-        } else if (!last_cycle && useless == 0 && unstable == 0) {
-            reloc_converged_ = true;
+            std::vector<int> frozen(N, 1);
+            for (int i : indices) frozen[i] = 0;
+            renderer_.set_frozen_mask(frozen.data(), N);
+            for (int li = 0; li < local_iters && !should_stop(); ++li) {
+                const float mse = run_single_iter(completed_iters);
+                publish_progress(mse, ++completed_iters);
+            }
+            std::fill(frozen.begin(), frozen.end(), 0);
+            renderer_.set_frozen_mask(frozen.data(), N);
+            const float proposed_mse = renderer_.render_forward_backward(N);
+            capture_best(proposed_mse);
+            if (proposed_mse > previous_mse) {
+                params_ = std::move(before_relocation);
+                renderer_.upload_params_gpu(params_.to_shape_params().data(), N);
+                VIN_INFO("Rejected relocation: MSE %.3f -> %.3f", previous_mse, proposed_mse);
+            }
+            // Frozen layers took no Adam steps during the local phase. Restart
+            // bias correction along with their moments before joint refinement.
+            renderer_.reset_adam_state_all_gpu(N);
+            adam_step_ = 0;
+        } else {
+            // Spend the full requested budget even when nothing needs recycling.
+            // The last cycle always uses these steps for joint fine tuning.
+            for (int li = 0; li < local_iters && !should_stop(); ++li) global_step();
         }
-        VIN_INFO("Cycle %d/%d: relocated=%zu", cycle + 1, num_cycles, candidates.size());
+        VIN_INFO("Cycle %d: relocated=%zu, iterations=%d/%d", cycle, indices.size(),
+                 completed_iters, config_.total_iters);
     }
 
     // Include the final update (or initial state when stopped immediately).
@@ -393,8 +415,8 @@ void GradientOptimizer::gradient_optimize() {
     }
     renderer_.upload_params_gpu(params_.to_shape_params().data(), N);
     renderer_.sync_stream();
-    if (progress_cb_) progress_cb_(should_stop() ? static_cast<float>(global_iter) / total_global_iters : 1.0f,
-                                  best_mse_, global_iter);
+    if (progress_cb_) progress_cb_(should_stop() ? static_cast<float>(completed_iters) / config_.total_iters : 1.0f,
+                                  best_mse_, completed_iters);
     VIN_INFO("Restored best evaluated parameters: MSE=%.3f", best_mse_);
 }
 
@@ -403,7 +425,6 @@ void GradientOptimizer::gradient_optimize() {
 // ================================================================
 
 void GradientOptimizer::find_relocation_candidates(
-    const std::vector<float>& grads,
     const std::vector<float>& visibility,
     std::vector<int>& candidates,
     int& n_useful, int& n_useless, int& n_unstable)
@@ -467,7 +488,11 @@ void GradientOptimizer::find_relocation_candidates(
     // Sort by visibility (lowest first)
     std::sort(cand_list.begin(), cand_list.end());
     candidates.clear();
-    for (auto& [_, i] : cand_list) candidates.push_back(i);
+    const int limit = std::max(1, static_cast<int>(N * config_.reloc_max_fraction));
+    for (auto& [_, i] : cand_list) {
+        if (static_cast<int>(candidates.size()) >= limit) break;
+        candidates.push_back(i);
+    }
 }
 
 std::vector<int> GradientOptimizer::relocate_shapes(OptParams& params,
@@ -479,62 +504,53 @@ std::vector<int> GradientOptimizer::relocate_shapes(OptParams& params,
     int total_pixels = H_opt_ * W_opt_;
     std::vector<float> rendered(total_pixels * 3);
     renderer_.download_output(rendered.data());
+    std::vector<float> rendered_alpha(total_pixels), radius_scale(total_pixels);
+    renderer_.download_alpha(rendered_alpha.data());
 
     // Match the weighted RGB objective, so relocation keeps prioritizing features.
     cv::Mat error_map = cv::Mat::zeros(H_opt_, W_opt_, CV_32FC1);
     for (int y = 0; y < H_opt_; ++y) {
         for (int x = 0; x < W_opt_; ++x) {
             int idx = y * W_opt_ + x;
+            radius_scale[idx] = saliency_radius_scale(saliency_small_.at<float>(y, x));
             if (!mask_small_.at<uint8_t>(y, x)) continue;
             auto& tc = loss_target_small_.at<cv::Vec3f>(y, x);
             float dr = rendered[idx * 3 + 0] - tc[0];
             float dg = rendered[idx * 3 + 1] - tc[1];
             float db = rendered[idx * 3 + 2] - tc[2];
+            // Missing coverage matters even where RGB matches the background.
+            const float missing_alpha = std::max(0.0f,
+                target_alpha_small_.at<float>(y, x) - rendered_alpha[idx]);
             error_map.at<float>(y, x) = (dr * dr + dg * dg + db * db)
-                                      * rgb_loss_weights_.at<float>(y, x);
+                * rgb_loss_weights_.at<float>(y, x) + missing_alpha * missing_alpha;
         }
     }
 
-    // Top-K sampling
-    cv::Mat flat_error = error_map.reshape(1, 1);
-    int K = std::max(n * 5, std::min(50, static_cast<int>(flat_error.cols * 0.05)));
-    cv::Mat sorted_indices;
-    cv::sortIdx(flat_error, sorted_indices, cv::SORT_DESCENDING);
+    const int long_edge = std::max(W_opt_, H_opt_);
+    const float size_lo = std::max(1.0f, long_edge * (config_.reloc_radius_lo / 100.0f));
+    const float size_hi = std::max(size_lo, long_edge * (config_.reloc_radius_hi / 100.0f));
+    const auto seeds = select_residual_seeds(error_map.ptr<float>(), W_opt_, H_opt_, n,
+                                            size_lo, size_hi, radius_scale.data());
+    n = static_cast<int>(seeds.size());
+    if (n == 0) return {};
 
-    std::uniform_int_distribution<int> dist_k(0, K - 1);
-    int long_edge = std::max(W_opt_, H_opt_);
-    float size_lo = long_edge * (config_.reloc_radius_lo / 100.0f);
-    float size_hi = long_edge * (config_.reloc_radius_hi / 100.0f);
-    std::uniform_real_distribution<float> dist_size(size_lo, size_hi);
-    std::uniform_real_distribution<float> dist_angle(0.0f, 360.0f);
-
-    // Compute new params for relocated shapes
-    std::vector<float> nc_x(n), nc_y(n), nr_x(n), nr_y(n), na_ng(n);
-    std::vector<float> nc_r(n), nc_g(n), nc_b(n), nc_a(n);
-    for (int j = 0; j < n; ++j) {
-        int k_idx = dist_k(rng_);
-        int flat_idx = sorted_indices.at<int>(0, std::min(k_idx, flat_error.cols - 1));
-        int new_y = flat_idx / W_opt_, new_x = flat_idx % W_opt_;
-
-        nc_x[j] = static_cast<float>(new_x);
-        nc_y[j] = static_cast<float>(new_y);
-        float priority = saliency_small_.at<float>(new_y, new_x);
-        float detail_scale = saliency_radius_scale(priority);
-        nr_x[j] = std::max(1.0f, dist_size(rng_) * detail_scale);
-        nr_y[j] = std::max(1.0f, dist_size(rng_) * detail_scale);
-        na_ng[j] = dist_angle(rng_);
-        nc_a[j] = 255.0f;
-
-        // Preserve small eye/lip color differences that palette merging can erase.
-        auto [r, g, b] = priority > 1.0f
-            ? get_local_color(new_x, new_y) : get_posterized_color(new_x, new_y);
-        nc_r[j] = r; nc_g[j] = g; nc_b[j] = b;
+    std::vector<ShapeParams> replacements;
+    replacements.reserve(n);
+    for (const auto& seed : seeds) {
+        ShapeParams shape{};
+        shape.cx = static_cast<float>(seed.x); shape.cy = static_cast<float>(seed.y);
+        shape.rx = seed.rx; shape.ry = seed.ry; shape.angle = seed.angle;
+        auto [r, g, b] = get_local_color(shape.cx, shape.cy);
+        shape.color_r = static_cast<float>(r); shape.color_g = static_cast<float>(g);
+        shape.color_b = static_cast<float>(b);
+        shape.opacity = target_alpha_small_.at<float>(seed.y, seed.x) / 255.0f;
+        replacements.push_back(shape);
     }
 
     // Compact params_: remove relocated shapes, shift others forward
     int N = params.N;
     std::vector<bool> is_reloc(N, false);
-    for (int i : indices) is_reloc[i] = true;
+    for (int j = 0; j < n; ++j) is_reloc[indices[j]] = true;
 
     auto compact = [&](auto& vec) {
         int w = 0;
@@ -558,51 +574,12 @@ std::vector<int> GradientOptimizer::relocate_shapes(OptParams& params,
     for (int j = 0; j < n; ++j) {
         int dst = base + j;
         new_indices.push_back(dst);
-        params.cx[dst] = nc_x[j]; params.cy[dst] = nc_y[j];
-        params.rx[dst] = nr_x[j]; params.ry[dst] = nr_y[j];
-        params.angle[dst] = na_ng[j];
-        params.color_r[dst] = nc_r[j]; params.color_g[dst] = nc_g[j];
-        params.color_b[dst] = nc_b[j]; params.color_a[dst] = nc_a[j];
+        params.set_shape(dst, replacements[j]);
     }
 
     reloc_total_ += n;
     VIN_INFO("Relocated %d shapes to top layer (total: %d)", n, reloc_total_);
     return new_indices;
-}
-
-float GradientOptimizer::run_local_phase(OptParams& params,
-                                          const std::vector<int>& reloc_indices,
-                                          int num_iters) {
-    int N = params.N;
-
-    // Build frozen mask (frozen shapes won't be updated by GPU Adam)
-    std::vector<bool> is_frozen(N, true);
-    for (int i : reloc_indices) is_frozen[i] = false;
-    std::vector<int> frozen_indices;
-    for (int i = 0; i < N; ++i) {
-        if (is_frozen[i]) frozen_indices.push_back(i);
-    }
-
-    // Set frozen mask on GPU
-    std::vector<int> frozen_mask(N, 0);
-    for (int i : frozen_indices) frozen_mask[i] = 1;
-    renderer_.set_frozen_mask(frozen_mask.data(), N);
-
-    std::vector<float> grads(N * 9, 0.0f);
-    float final_mse = 0.0f;
-
-    for (int li = 0; li < num_iters; ++li) {
-        if (should_stop()) break;
-
-        final_mse = run_single_iter(params, grads, li, num_iters,
-                                     nullptr, 0, true, frozen_indices);
-    }
-
-    // Clear frozen mask after local phase
-    std::vector<int> clear_mask(N, 0);
-    renderer_.set_frozen_mask(clear_mask.data(), N);
-
-    return final_mse;
 }
 
 // ================================================================

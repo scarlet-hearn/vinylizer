@@ -41,7 +41,7 @@ void cuda_render_tile_forward(
     const float* d_bg_color,
     const float* d_sina, const float* d_cosa,
     float* d_alpha_scratch,
-    float* d_r_norm_scratch,
+    float* d_transmittance_scratch,
     float* d_output,
     const float* h_cx, const float* h_cy,
     const float* h_rx, const float* h_ry,
@@ -64,9 +64,10 @@ void cuda_render_tile_backward(
     const float* d_opacity,
     const float* d_bg_color,
     const float* d_grad_output,
+    const float* d_output,
     const float* d_sina, const float* d_cosa,
     const float* d_alpha_scratch,
-    const float* d_r_norm_scratch,
+    const float* d_transmittance_scratch,
     float* d_grad_cx, float* d_grad_cy,
     float* d_grad_rx, float* d_grad_ry,
     float* d_grad_angle,
@@ -93,9 +94,10 @@ void cuda_render_tile_forward_backward_per_tile(
     const float* d_opacity,
     const float* d_bg_color,
     const float* d_grad_output,
+    const float* d_output,
     const float* d_sina, const float* d_cosa,
     float* d_alpha_scratch,
-    float* d_r_norm_scratch,
+    float* d_transmittance_scratch,
     float* d_grad_cx, float* d_grad_cy,
     float* d_grad_rx, float* d_grad_ry,
     float* d_grad_angle,
@@ -124,7 +126,7 @@ void cuda_render_tile_visibility(
     const float* d_bg_color,
     const float* d_sina, const float* d_cosa,
     float* d_alpha_scratch,
-    float* d_r_norm_scratch,
+    float* d_transmittance_scratch,
     float* d_visibility,
     const float* h_cx, const float* h_cy,
     const float* h_rx, const float* h_ry,
@@ -293,7 +295,9 @@ __global__ void fused_adam_kernel(
     adam_update(d_colors[i*3+0], g[5], m_cr[i], v_cr[i], 1.0f);
     adam_update(d_colors[i*3+1], g[6], m_cg[i], v_cg[i], 1.0f);
     adam_update(d_colors[i*3+2], g[7], m_cb[i], v_cb[i], 1.0f);
-    adam_update(d_opacity[i],     g[8], m_ca[i], v_ca[i], 1.0f);
+    // Opacity is [0,1], unlike byte-scaled color. A unit step previously jumped
+    // directly between transparent and opaque, discarding intermediate blends.
+    adam_update(d_opacity[i],     g[8], m_ca[i], v_ca[i], 1.0f / 255.0f);
 
     // Parameter clamping
     d_cx[i] = fmaxf(0.0f, fminf(d_cx[i], (float)(W - 1)));
@@ -384,7 +388,7 @@ DiffRenderer::~DiffRenderer() {
     // Frozen mask and gradient norm accumulator
     cudaFree(s.d_frozen_mask);
     cudaFree(s.d_grad_norm_sq);
-    cudaFree(s.d_alpha_scratch); cudaFree(s.d_r_norm_scratch);
+    cudaFree(s.d_alpha_scratch); cudaFree(s.d_transmittance_scratch);
     cudaFree(s.d_active_indices);
     cudaFree(s.d_active_indices_per_tile);
     cudaFree(s.d_active_count_per_tile);
@@ -408,7 +412,7 @@ DiffRenderer::~DiffRenderer() {
     if (s.stream) cudaStreamDestroy(s.stream);
 }
 
-void DiffRenderer::init(int canvas_w, int canvas_h, int max_shapes) {
+void DiffRenderer::init(int canvas_w, int canvas_h, int max_shapes, int max_tile_pixels) {
     if (initialized_ || scratch_.stream) throw std::logic_error("Renderer already initialized");
     if (canvas_w <= 0 || canvas_h <= 0 || max_shapes <= 0 || max_shapes > 65535
         || static_cast<long long>(canvas_w) * canvas_h > std::numeric_limits<int>::max() / 4)
@@ -446,6 +450,9 @@ void DiffRenderer::init(int canvas_w, int canvas_h, int max_shapes) {
         s.tile_pixels = std::min(s.tile_pixels, s.total_pixels);
         VIN_INFO("Fallback tile: %d pixels/tile (cudaMemGetInfo failed)", s.tile_pixels);
     }
+
+    if (max_tile_pixels > 0) s.tile_pixels = std::min(s.tile_pixels, max_tile_pixels);
+    full_scratch_ = s.tile_pixels == s.total_pixels;
 
     // Create CUDA stream
     CUDA_CHECK(cudaStreamCreate(&s.stream));
@@ -535,7 +542,7 @@ void DiffRenderer::init(int canvas_w, int canvas_h, int max_shapes) {
 
     // Scratch buffers for tile forward
     CUDA_CHECK(cudaMalloc(&s.d_alpha_scratch, (size_t)max_shapes * s.tile_pixels * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&s.d_r_norm_scratch, (size_t)max_shapes * s.tile_pixels * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&s.d_transmittance_scratch, (size_t)max_shapes * s.tile_pixels * sizeof(float)));
 
     // Active indices
     CUDA_CHECK(cudaMalloc(&s.d_active_indices, max_shapes * sizeof(int)));
@@ -673,7 +680,7 @@ void DiffRenderer::compute_visibility(int N) {
         s.d_px, s.d_py, s.d_ste_cx, s.d_ste_cy, s.d_ste_rx, s.d_ste_ry, s.d_ste_angle,
         s.d_ste_colors, s.d_ste_opacity, s.d_bg_color,
         s.d_sina, s.d_cosa,
-        s.d_alpha_scratch, s.d_r_norm_scratch,
+        s.d_alpha_scratch, s.d_transmittance_scratch,
         s.d_visibility,
         s.h_cx, s.h_cy, s.h_rx, s.h_ry,
         h_px_.data(), h_py_.data(),
@@ -721,6 +728,13 @@ void DiffRenderer::download_output(float* h_output) {
     auto& s = scratch_;
     CUDA_CHECK(cudaMemcpyAsync(h_output, s.d_output, s.total_pixels * 3 * sizeof(float),
                                cudaMemcpyDeviceToHost, s.stream));
+    CUDA_CHECK(cudaStreamSynchronize(s.stream));
+}
+
+void DiffRenderer::download_alpha(float* h_alpha) {
+    auto& s = scratch_;
+    CUDA_CHECK(cudaMemcpyAsync(h_alpha, s.d_rendered_alpha, s.total_pixels * sizeof(float),
+                              cudaMemcpyDeviceToHost, s.stream));
     CUDA_CHECK(cudaStreamSynchronize(s.stream));
 }
 
@@ -772,7 +786,7 @@ float DiffRenderer::render_forward_backward(int N, float* d_grad_history, int wr
         s.d_px, s.d_py, s.d_ste_cx, s.d_ste_cy, s.d_ste_rx, s.d_ste_ry, s.d_ste_angle,
         s.d_ste_colors, s.d_ste_opacity, s.d_bg_color,
         s.d_sina, s.d_cosa,
-        s.d_alpha_scratch, s.d_r_norm_scratch,
+        s.d_alpha_scratch, s.d_transmittance_scratch,
         s.d_output,
         s.h_cx, s.h_cy, s.h_rx, s.h_ry,
         h_px_.data(), h_py_.data(),
@@ -792,9 +806,9 @@ float DiffRenderer::render_forward_backward(int N, float* d_grad_history, int wr
         // Full-size scratch: reuse data from step 1, no re-forward needed
         cuda_render_tile_backward(
             s.d_px, s.d_py, s.d_ste_cx, s.d_ste_cy, s.d_ste_rx, s.d_ste_ry, s.d_ste_angle,
-            s.d_ste_colors, s.d_ste_opacity, s.d_bg_color, s.d_grad_output,
+            s.d_ste_colors, s.d_ste_opacity, s.d_bg_color, s.d_grad_output, s.d_output,
             s.d_sina, s.d_cosa,
-            s.d_alpha_scratch, s.d_r_norm_scratch,
+            s.d_alpha_scratch, s.d_transmittance_scratch,
             s.d_grad_cx, s.d_grad_cy, s.d_grad_rx, s.d_grad_ry,
             s.d_grad_angle, s.d_grad_colors, s.d_grad_opacity,
             s.h_cx, s.h_cy, s.h_rx, s.h_ry,
@@ -809,9 +823,9 @@ float DiffRenderer::render_forward_backward(int N, float* d_grad_history, int wr
         // Tiled: re-forward per-tile for scratch, then backward
         cuda_render_tile_forward_backward_per_tile(
             s.d_px, s.d_py, s.d_ste_cx, s.d_ste_cy, s.d_ste_rx, s.d_ste_ry, s.d_ste_angle,
-            s.d_ste_colors, s.d_ste_opacity, s.d_bg_color, s.d_grad_output,
+            s.d_ste_colors, s.d_ste_opacity, s.d_bg_color, s.d_grad_output, s.d_output,
             s.d_sina, s.d_cosa,
-            s.d_alpha_scratch, s.d_r_norm_scratch,
+            s.d_alpha_scratch, s.d_transmittance_scratch,
             s.d_grad_cx, s.d_grad_cy, s.d_grad_rx, s.d_grad_ry,
             s.d_grad_angle, s.d_grad_colors, s.d_grad_opacity,
             s.h_cx, s.h_cy, s.h_rx, s.h_ry,

@@ -6,7 +6,7 @@
 namespace vinylizer {
 
 // Shape parameters packed for GPU transfer
-// Each shape: cx, cy, rx, ry, angle, color[3], opacity = 8 floats
+// Each shape: cx, cy, rx, ry, angle, color[3], opacity = 9 floats
 struct ShapeParams {
     float cx, cy, rx, ry, angle;
     float color_r, color_g, color_b;
@@ -75,7 +75,7 @@ struct RenderScratch {
 
     // Scratch for tile forward [N * tile_pixels]
     float* d_alpha_scratch = nullptr;
-    float* d_r_norm_scratch = nullptr;
+    float* d_transmittance_scratch = nullptr; // product of (1-alpha) above each layer
 
     // Active indices buffer [N]
     int* d_active_indices = nullptr;
@@ -142,7 +142,8 @@ public:
     DiffRenderer(const DiffRenderer&) = delete;
     DiffRenderer& operator=(const DiffRenderer&) = delete;
 
-    void init(int canvas_w, int canvas_h, int max_shapes);
+    // Optional tile limit bounds scratch memory and enables tiled regression checks.
+    void init(int canvas_w, int canvas_h, int max_shapes, int max_tile_pixels = 0);
     // Optional RGB weights must be finite, nonnegative, and mean one over
     // opaque pixels. nullptr restores uniform weighting; alpha is unweighted.
     void set_target(const float* h_target, const float* h_mask, const float* h_target_alpha,
@@ -160,6 +161,7 @@ public:
     // Download current d_output (already rendered by render_forward_backward)
     // Avoids re-rendering for relocation error map computation
     void download_output(float* h_output);
+    void download_alpha(float* h_alpha);
 
     // Forward + backward: compute MSE and gradients (GPU-resident params)
     // d_grad_history: optional ring buffer for per-shape gradient norms (relocation)

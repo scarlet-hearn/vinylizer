@@ -8,6 +8,7 @@
 
 #include "common/alpha_228.h"
 #include "cuda/color_utils.cuh"
+#include "core/compositing_gradient.h"
 
 #define PI_F 3.14159265358979323846f
 
@@ -85,7 +86,7 @@ __global__ void render_forward_kernel(
 }
 
 // ============================================================
-// Tile forward kernel (saves alpha/r_norm for backward)
+// Tile forward kernel (saves alpha/above-transmittance for backward)
 // ============================================================
 
 __global__ void render_tile_forward_kernel(
@@ -98,7 +99,7 @@ __global__ void render_tile_forward_kernel(
     const float* __restrict__ opacity,
     const float* __restrict__ sina, const float* __restrict__ cosa,
     float* __restrict__ alpha_scratch,
-    float* __restrict__ r_norm_scratch,
+    float* __restrict__ transmittance_scratch,
     const int* __restrict__ active_indices,
     int num_active, int N, int tile_count,
     cudaTextureObject_t alpha_tex,
@@ -123,7 +124,7 @@ __global__ void render_tile_forward_kernel(
         float rn = sqrtf(fmaxf(dsq, 0.0f));
         float ar = alpha_228_tex(rn, alpha_tex);
         alpha_scratch[(long long)i * tile_count + local_idx] = ar;
-        r_norm_scratch[(long long)i * tile_count + local_idx] = rn;
+        transmittance_scratch[(long long)i * tile_count + local_idx] = T;
 
         // Accumulate rendering (linear space, matching v5)
         float ae = ar * opacity[i], w = ae * T;
@@ -131,7 +132,8 @@ __global__ void render_tile_forward_kernel(
         gg += w * srgb_to_linear(colors[i*3+1]);
         bb += w * srgb_to_linear(colors[i*3+2]);
         T *= (1.0f - ae);
-        if (T < 1e-3f) break;
+        // Always initialize scratch for every active shape. Early termination
+        // leaves stale entries that backward/visibility would interpret as alpha.
     }
     rr += T * srgb_to_linear(bg_color[0]);
     gg += T * srgb_to_linear(bg_color[1]);
@@ -152,6 +154,7 @@ __global__ void render_tile_forward_kernel(
 
 __global__ void render_backward_kernel(
     const float* __restrict__ grad_output,
+    const float* __restrict__ output,
     const float* __restrict__ px, const float* __restrict__ py,
     const float* __restrict__ cx, const float* __restrict__ cy,
     const float* __restrict__ rx, const float* __restrict__ ry,
@@ -162,7 +165,7 @@ __global__ void render_backward_kernel(
     const float* __restrict__ sina,
     const float* __restrict__ cosa,
     const float* __restrict__ alpha_scratch,
-    const float* __restrict__ r_norm_scratch,
+    const float* __restrict__ transmittance_scratch,
     float* __restrict__ grad_cx,
     float* __restrict__ grad_cy,
     float* __restrict__ grad_rx,
@@ -178,9 +181,11 @@ __global__ void render_backward_kernel(
     bool valid = local_idx < tile_count;
     float pxi = valid ? px[local_idx] : 0.0f;
     float pyi = valid ? py[local_idx] : 0.0f;
-    float gdr = valid ? grad_output[local_idx*3+0] : 0.0f;
-    float gdg = valid ? grad_output[local_idx*3+1] : 0.0f;
-    float gdb = valid ? grad_output[local_idx*3+2] : 0.0f;
+    float grad_linear[3]{};
+    if (valid) {
+        for (int c = 0; c < 3; ++c) grad_linear[c] = vinylizer::output_to_linear_gradient(
+            grad_output[local_idx * 3 + c], output[local_idx * 3 + c]);
+    }
     float gda = (valid && grad_alpha) ? grad_alpha[local_idx] : 0.0f;
 
     int wid = threadIdx.x >> 5;
@@ -188,58 +193,28 @@ __global__ void render_backward_kernel(
     int num_warps = blockDim.x >> 5;
     __shared__ float s_block[9 * 32];
 
-    double lTN = 0.0;
-    for (int j = 0; j < num_active; j++) {
-        int i = active_indices[j];
-        float ar = valid ? alpha_scratch[(long long)i * tile_count + local_idx] : 0.0f;
-        if (ar <= 0.0f) continue;
-        float ae = ar * opacity[i];
-        if (ae >= 1.0f) { lTN = -1e10; break; }
-        double oma = 1.0 - (double)ae;
-        if (oma < 1e-15) oma = 1e-15;
-        lTN += log(oma);
-    }
-
-    double lTB = 0.0;
-    float car = bg_color[0], cag = bg_color[1], cab = bg_color[2];
+    float below_transmittance = 1.0f;
+    float below_linear[3] = {srgb_to_linear(bg_color[0]), srgb_to_linear(bg_color[1]),
+                             srgb_to_linear(bg_color[2])};
     for (int j = 0; j < num_active; j++) {
         int i = active_indices[j];
         float ar = valid ? alpha_scratch[(long long)i * tile_count + local_idx] : 0.0f;
         float lcx=0,lcy=0,lrx=0,lry=0,lan=0,lcr=0,lcg=0,lcb=0,lop=0;
         if (ar > 0.0f) {
-            float rn = valid ? r_norm_scratch[(long long)i * tile_count + local_idx] : 0.0f;
-            float opi = opacity[i], clr = colors[i*3+0], clg = colors[i*3+1], clb = colors[i*3+2];
-            float cxi = cx[i], cyi = cy[i], rxi = rx[i], ryi = ry[i];
-            float ae = ar * opi;
-            double oma = 1.0 - (double)ae;
-            if (oma < 1e-15) oma = 1e-15;
-            float omaf = (float)oma;
-            double lT_i = lTN - lTB - log(oma);
-            float Ti = exp((float)lT_i);
-            if (Ti > 1.0f) Ti = 1.0f;
-            float wi = ae * Ti; lcr=gdr*wi; lcg=gdg*wi; lcb=gdb*wi;
-            if (Ti > 1e-6f) {
-                float dcdar=Ti*(clr-car), dcdag=Ti*(clg-cag), dcdab=Ti*(clb-cab);
-                float dlae = gdr*dcdar + gdg*dcdag + gdb*dcdab + gda*255.0f*Ti;
-                float aval = ar;
-                float denom = C1_228 + 2.0f*C2_228*aval + 3.0f*C3_228*aval*aval;
-                float dadr = -1.0f / fmaxf(denom, 1e-10f);
-                float rc = fmaxf(rn, 1e-6f), daddsq = dadr / (2.0f * rc);
-                float coi=cosa[i], sii=sina[i];
-                float dx = pxi - cxi, dy = pyi - cyi;
-                float u=dx*coi+dy*sii, v=-dx*sii+dy*coi;
-                float rxc=fmaxf(rxi,0.5f), ryc=fmaxf(ryi,0.5f);
-                float rx2=rxc*rxc, ry2=ryc*ryc;
-                float dadcx = daddsq * (-2.0f) * (u*coi/rx2 - v*sii/ry2);
-                float dadcy = daddsq * (-2.0f) * (u*sii/rx2 + v*coi/ry2);
-                float dadrx = daddsq * (-2.0f * u*u / (rxc*rx2));
-                float dadry = daddsq * (-2.0f * v*v / (ryc*ry2));
-                float dadan = daddsq * 2.0f*u*v * (PI_F/180.0f) * (1.0f/rx2 - 1.0f/ry2);
-                lcx=dlae*opi*dadcx; lcy=dlae*opi*dadcy; lrx=dlae*opi*dadrx;
-                lry=dlae*opi*dadry; lan=dlae*opi*dadan; lop=dlae*ar;
-            }
-            car=ae*clr+omaf*car; cag=ae*clg+omaf*cag; cab=ae*clb+omaf*cab;
-            lTB += log(oma);
+            const float opi = opacity[i], ae = ar * opi;
+            const float above = transmittance_scratch[(long long)i * tile_count + local_idx];
+            const auto layer = vinylizer::composite_layer_gradient(grad_linear, gda,
+                colors + i * 3, below_linear, ae, above, below_transmittance);
+            lcr = layer.color[0]; lcg = layer.color[1]; lcb = layer.color[2];
+            const auto geometry = vinylizer::ellipse_alpha_gradient(pxi - cx[i], pyi - cy[i],
+                rx[i], ry[i], sina[i], cosa[i], ar);
+            const float scale = layer.effective_alpha * opi;
+            lcx = scale * geometry.cx; lcy = scale * geometry.cy;
+            lrx = scale * geometry.rx; lry = scale * geometry.ry;
+            lan = scale * geometry.angle; lop = layer.effective_alpha * ar;
+            for (int c = 0; c < 3; ++c) below_linear[c] = ae * srgb_to_linear(colors[i * 3 + c])
+                + (1.0f - ae) * below_linear[c];
+            below_transmittance *= 1.0f - ae;
         }
         unsigned warp_active = __activemask();
         #pragma unroll
@@ -364,7 +339,7 @@ void cuda_render_tile_forward(
     const float* d_bg_color,
     const float* d_sina, const float* d_cosa,
     float* d_alpha_scratch,
-    float* d_r_norm_scratch,
+    float* d_transmittance_scratch,
     float* d_output,
     const float* h_cx, const float* h_cy,
     const float* h_rx, const float* h_ry,
@@ -427,7 +402,7 @@ void cuda_render_tile_forward(
             d_cx, d_cy, d_rx, d_ry, d_angle,
             d_colors, d_opacity,
             d_sina, d_cosa,
-            d_alpha_scratch, d_r_norm_scratch,
+            d_alpha_scratch, d_transmittance_scratch,
             d_active_indices, na, N, p_count,
             alpha_tex,
             d_output + p_start * 3,
@@ -446,9 +421,10 @@ void cuda_render_tile_backward(
     const float* d_opacity,
     const float* d_bg_color,
     const float* d_grad_output,
+    const float* d_output,
     const float* d_sina, const float* d_cosa,
     const float* d_alpha_scratch,
-    const float* d_r_norm_scratch,
+    const float* d_transmittance_scratch,
     float* d_grad_cx, float* d_grad_cy,
     float* d_grad_rx, float* d_grad_ry,
     float* d_grad_angle,
@@ -507,11 +483,12 @@ void cuda_render_tile_backward(
         // Backward
         render_backward_kernel<<<blocks, threads, 0, stream>>>(
             d_grad_output + p_start * 3,
+            d_output + p_start * 3,
             d_px + p_start, d_py + p_start,
             d_cx, d_cy, d_rx, d_ry, d_angle,
             d_colors, d_opacity, d_bg_color,
             d_sina, d_cosa,
-            d_alpha_scratch, d_r_norm_scratch,
+            d_alpha_scratch, d_transmittance_scratch,
             d_grad_cx, d_grad_cy,
             d_grad_rx, d_grad_ry,
             d_grad_angle, d_grad_colors, d_grad_opacity,
@@ -531,9 +508,10 @@ void cuda_render_tile_forward_backward_per_tile(
     const float* d_opacity,
     const float* d_bg_color,
     const float* d_grad_output,
+    const float* d_output,
     const float* d_sina, const float* d_cosa,
     float* d_alpha_scratch,
-    float* d_r_norm_scratch,
+    float* d_transmittance_scratch,
     float* d_grad_cx, float* d_grad_cy,
     float* d_grad_rx, float* d_grad_ry,
     float* d_grad_angle,
@@ -590,7 +568,7 @@ void cuda_render_tile_forward_backward_per_tile(
             d_cx, d_cy, d_rx, d_ry, d_angle,
             d_colors, d_opacity,
             d_sina, d_cosa,
-            d_alpha_scratch, d_r_norm_scratch,
+            d_alpha_scratch, d_transmittance_scratch,
             d_active_indices, na, N, p_count,
             alpha_tex,
             nullptr, // output not needed here
@@ -600,11 +578,12 @@ void cuda_render_tile_forward_backward_per_tile(
         // Tile backward: read scratch, accumulate gradients
         render_backward_kernel<<<blocks, threads, 0, stream>>>(
             d_grad_output + p_start * 3,
+            d_output + p_start * 3,
             d_px + p_start, d_py + p_start,
             d_cx, d_cy, d_rx, d_ry, d_angle,
             d_colors, d_opacity, d_bg_color,
             d_sina, d_cosa,
-            d_alpha_scratch, d_r_norm_scratch,
+            d_alpha_scratch, d_transmittance_scratch,
             d_grad_cx, d_grad_cy,
             d_grad_rx, d_grad_ry,
             d_grad_angle, d_grad_colors, d_grad_opacity,
@@ -651,7 +630,7 @@ void cuda_render_tile_visibility(
     const float* d_bg_color,
     const float* d_sina, const float* d_cosa,
     float* d_alpha_scratch,
-    float* d_r_norm_scratch,
+    float* d_transmittance_scratch,
     float* d_visibility,
     const float* h_cx, const float* h_cy,
     const float* h_rx, const float* h_ry,
@@ -702,7 +681,7 @@ void cuda_render_tile_visibility(
             d_cx, d_cy, d_rx, d_ry, d_angle,
             d_colors, d_opacity,
             d_sina, d_cosa,
-            d_alpha_scratch, d_r_norm_scratch,
+            d_alpha_scratch, d_transmittance_scratch,
             d_active_indices, na, N, p_count,
             alpha_tex,
             nullptr, d_bg_color,
