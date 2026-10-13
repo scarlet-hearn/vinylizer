@@ -19,6 +19,11 @@ target_compile_features(fitting_math_test PRIVATE cxx_std_17)
 target_include_directories(fitting_math_test PRIVATE "${VINYLIZER_ROOT}/src")
 add_test(NAME fitting_math COMMAND fitting_math_test)
 
+add_executable(gui_config_test gui_config_test.cpp)
+target_compile_features(gui_config_test PRIVATE cxx_std_17)
+target_include_directories(gui_config_test PRIVATE "${VINYLIZER_ROOT}/src")
+add_test(NAME gui_config COMMAND gui_config_test)
+
 option(VINYLIZER_TEST_CUDA "Test real renderer gradients on a CUDA device" OFF)
 if(VINYLIZER_TEST_CUDA)
     enable_language(CUDA)
@@ -41,6 +46,22 @@ if(WIN32)
     target_compile_features(safety_test PRIVATE cxx_std_17)
     target_include_directories(safety_test PRIVATE "${VINYLIZER_ROOT}/src" "${VINYLIZER_ROOT}/vendor")
     add_test(NAME safety COMMAND safety_test)
+endif()
+
+if(VINYLIZER_ENABLE_GUI)
+    add_executable(gui_preview_test gui_preview_test.cpp
+        "${VINYLIZER_ROOT}/src/gui/json_preview.cpp"
+        "${VINYLIZER_ROOT}/src/common/canvas.cpp"
+        "${VINYLIZER_ROOT}/src/cuda/canvas_render.cu"
+        "${VINYLIZER_ROOT}/src/inject/inject.cpp")
+    target_compile_features(gui_preview_test PRIVATE cxx_std_17)
+    set_target_properties(gui_preview_test PROPERTIES
+        CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON CUDA_SEPARABLE_COMPILATION ON)
+    target_include_directories(gui_preview_test PRIVATE
+        "${VINYLIZER_ROOT}/src" "${VINYLIZER_ROOT}/vendor" ${OpenCV_INCLUDE_DIRS})
+    target_link_libraries(gui_preview_test PRIVATE Qt6::Gui opencv_core CUDA::cudart)
+    add_test(NAME gui_preview COMMAND gui_preview_test)
+    set_tests_properties(gui_preview PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
 option(VINYLIZER_TEST_OPENCV "Test facial maps, weights, and cascade assets" ON)

@@ -2,17 +2,21 @@
 
 ## 本机编译与测试（2026-10-13）
 
-已在 RTX 4060 上完成 Release 命令行程序构建，6 项 CPU/OpenCV/CUDA 测试全部通过，RGB 和半透明 RGBA 图片的优化、定量图层导出及 PNG 预览流程也已运行通过。工具安装在被 Git 忽略的 `build/toolchain`；复用本机 Visual Studio 2022 的 `cl`。未构建 Qt GUI，也未进行真实游戏导入。
+已在 RTX 4060 上完成 Release 命令行及 Qt 6.8.3 GUI 构建，Qt 构建的 8 项 CPU/OpenCV/CUDA/GUI 回归测试全部通过。实际窗口已验证 RGB、中文路径的半透明 RGBA 图片导入、参数编辑、优化进度、JSON 导出、中途停止保存和导入页预览。工具安装在被 Git 忽略的 `build/toolchain`；复用本机 Visual Studio 2022 的 `cl`。尚未进行真实游戏导入。
 
 ```powershell
 # 在项目根目录构建并运行全部测试（默认 RTX 4060 / sm_89）
 ./tools/Build-Windows.ps1
 
+# 构建 Qt GUI 并运行全部测试（Qt 默认位于 build/toolchain/qt）
+./tools/Build-Windows.ps1 -Gui
+# 其他 Qt 安装可使用 -QtDirectory C:/Qt/6.8.3/msvc2022_64
+
 # 仅在当前 PowerShell 中启用 cmake、nvcc、cl 和依赖
 . ./tools/Enter-BuildEnvironment.ps1
 ```
 
-主程序输出为 `build/windows/vinylizer.exe`。工具版本、验证范围与结果见 [编译验证记录](docs/BUILD_VALIDATION.md)。
+CLI 输出为 `build/windows/vinylizer.exe`，GUI 输出为 `build/windows-qt/vinylizer.exe`，均可直接启动。工具版本、验证范围与结果见 [编译验证记录](docs/BUILD_VALIDATION.md)。
 
 ## 固定图层数下的拟合改进
 
@@ -47,7 +51,7 @@ ctest --test-dir build-tests/cuda -C Release --output-on-failure
 - 每个更优的已评估状态在 Adam 更新前保存，覆盖全局、局部迭代和最后一次更新；停止时恢复最佳状态。界面的最终 MSE 对应该已评估状态。
 - CUDA 分配/传输/同步失败会中止并向调用方报错；异常退出也会清理资源。JSON 文件打开及最终写入失败会抛出错误，CLI 返回非零，GUI 区分失败、正常完成和停止保存，失败时不会读取旧 JSON 冒充新结果。
 
-当前已编译运行损失、Windows 安全、OpenCV 图像与 CUDA 渲染器测试。安全测试（见 `tests/safety_test.cpp`）只访问测试进程自己的模拟图层内存，不启动或操作游戏。Qt 界面与真实游戏导入仍待验证。
+当前已编译运行损失、Windows 安全、OpenCV 图像、CUDA 渲染器及 GUI 参数/预览测试。安全测试（见 `tests/safety_test.cpp`）只访问测试进程自己的模拟图层内存，不启动或操作游戏。Qt 界面已做实际交互验证；真实游戏导入仍待验证。
 
 ## 人脸、眼睛与嘴部加权
 

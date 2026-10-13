@@ -11,6 +11,7 @@
 | cl | 19.44.35215，工具集目录 14.44.35207 | 复用已有 Visual Studio Community 2022 |
 | Windows SDK | 10.0.26100.0，NuGet 包 10.0.26100.1882 | Microsoft 官方 CPP 和 CPP.x64 包，`build/toolchain/winsdk`、`winsdk-x64` |
 | OpenCV | 4.12.0 | 官方 Windows 发布包，`build/toolchain/opencv` |
+| Qt | 6.8.3 MSVC 2022 x64 | 官方 qtbase 分发包，`build/toolchain/qt` |
 
 新增组件均放在项目本地，未修改系统 PATH，也未更新显卡驱动。`Enter-BuildEnvironment.ps1` 只设置当前 PowerShell 会话的 PATH、INCLUDE、LIB 等变量。SDK 的头文件和库来自独立的官方 NuGet 包，因此 nvcc 使用 `--use-local-env` 复用已设置的环境。
 
@@ -56,8 +57,38 @@ MSVC 在受限沙箱中的编译探测曾报 C1902；相同工具链在正常本
 
 验证了导出参数均有限、RGBA 字节范围正确、图层数保持 32、预览可解码且尺寸正确。输入和输出保存在 `build/smoke`。这些合成用例验证流程可运行；上述 MSE 不是新旧算法的 A/B 对比，也不是自然图片画质提升的量化结果。
 
+## Qt 界面验证
+
+Qt 来自 [Qt 6.8.3 官方仓库](https://download.qt.io/online/qtsdkrepository/windows_x86/desktop/qt6_683/qt6_683/qt.qt6.683.win64_msvc2022_64/)，qtbase 包已核对官方 SHA-1：`ab0bd2551618f7128ef30c6d74fe45b6a76e2296`。无需 Qt Creator；qtbase 包含本项目所需的 Widgets、OpenGL、OpenGLWidgets、Concurrent 及 windeployqt。
+
+```powershell
+./tools/Build-Windows.ps1 -Gui
+# 可选：-QtDirectory C:/Qt/6.8.3/msvc2022_64
+./build/windows-qt/vinylizer.exe
+```
+
+独立目录 `build/windows-qt` 包含 Qt、OpenCV、CUDA DLL 和 Windows 平台插件，可在普通终端直接启动。`Build-Windows.ps1 -Gui` 实际执行成功，CTest **8/8 通过，无跳过**（4.69 秒）。在原 6 项测试基础上增加：
+
+- `gui_config`：完整文本解析，拒绝小数整数、空值、尾随字符、非有限数与溢出，验证学习率关系及循环预算边界。
+- `gui_preview`：真实 GPU 渲染，验证 JSON 画布尺寸与原点、越界图层裁剪、RGB 通道、透明合成、图层顺序、中文路径、无尺寸旧文件、2048 像素上限及错误输入。
+
+实际桌面交互使用 1200×800 的 Qt 窗口，输入文件和日志位于 `build/gui-smoke`：
+
+| 场景 | 验证结果 |
+| --- | --- |
+| 启动、中文标签、文件对话框、制作/导入切页 | 正常，无 Qt 平台插件或 OpenGL 初始化错误 |
+| RGB 96×80，150 层，2 循环 | 进度条、MSE 曲线和实时预览正常，完整导出 150 层 |
+| 中文文件名 RGBA，150 层，2 循环 | 正常读取和导出，103 层 Alpha 小于 255 |
+| 150 层，200 循环，中途停止 | 显示“已停止并保存结果”，导出完整 150 层及最佳参数 |
+| JSON 导入预览、占位层数不匹配 | 异步预览正常加载，错误消息可见，未进行游戏写入 |
+| 修复后 RGB 150 层、25 循环 | 正常完成；完成页按原画布显示，同一份旧 JSON 的导入预览也恢复正确构图 |
+| 修复后数值输入 | 图层数量拒绝小数点；导入层数 200000 时按钮禁用，点击不启动任务 |
+
+验证过程中修复两类问题：完成页和导入页以前按图层包围盒扩大画布，导致预览缩小并显示原画布外的图层；现在优先使用 JSON 的 width/height 和原点，旧版无尺寸文件保留包围盒兼容。自绘输入框以前用 `stoi` 接受部分文本，空层数会沿用旧值；现在优化配置完整校验，注入按钮和启动动作均验证当前层数文本。
+
+当前自绘输入框仍仅支持逐键编辑、左右键和 Backspace，不支持 Ctrl+A/粘贴；Tab 用于切换页面。透明输入在优化中的 RGB 实时帧与完成后的 Alpha 合成预览可能不同。以上合成输入用于流程验证，未替代真实图片集画质评估。
+
 ## 尚未覆盖
 
-- Qt GUI 的编译及交互测试（本次未安装 Qt）。
 - 真实 FH6 游戏进程的导入。
 - 新旧算法在同一真实图片集上的质量和耗时比较。

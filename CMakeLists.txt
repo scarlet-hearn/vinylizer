@@ -82,6 +82,7 @@ if(VINYLIZER_ENABLE_GUI)
     set(GUI_SOURCES
         src/gui/main_gui.cpp
         src/gui/render_canvas.cpp
+        src/gui/json_preview.cpp
         src/gui/optimize_worker.cpp
         src/gui/inject_worker.cpp
         icon/resources.qrc

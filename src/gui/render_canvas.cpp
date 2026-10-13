@@ -1,7 +1,8 @@
 #include "gui/render_canvas.h"
+#include "gui/config_validation.h"
 #include "gui/optimize_worker.h"
 #include "gui/inject_worker.h"
-#include "common/canvas.h"
+#include "gui/json_preview.h"
 #include "common/logger.h"
 #include "output/json_writer.h"
 
@@ -531,7 +532,8 @@ void RenderCanvas::draw_inject_page(QPainter& p) {
 
     // Inject button
     auto ibtn = inject_btn_rect();
-    bool inject_enabled = !inject_json_path_.empty() && !inject_running_;
+    bool inject_enabled = !inject_json_path_.empty() && !inject_running_
+        && gui::parse_inject_layer_count(inject_layer_text_).has_value();
     QColor ibtn_c = inject_enabled ? (inject_btn_hovered_ ? COL_ACCENT.lighter(110) : COL_ACCENT) : COL_TEXT3;
     draw_rounded_rect(p, QRectF(ibtn), ibtn_c, 6);
     p.setPen(inject_enabled ? COL_TEXT : COL_TEXT3);
@@ -830,7 +832,8 @@ void RenderCanvas::keyPressEvent(QKeyEvent* e) {
                 QString ch = e->text();
                 if (!ch.isEmpty() && ch[0].isPrint()) {
                     // Numeric only for all fields
-                    if (ch[0].isDigit() || (ch[0] == '.' && txt.find('.') == std::string::npos)) {
+                    if ((ch[0] >= '0' && ch[0] <= '9') ||
+                        (focused_input_ >= 4 && ch[0] == '.' && txt.find('.') == std::string::npos)) {
                         txt.insert(txt.begin() + cur, ch[0].toLatin1());
                         cur++;
                     }
@@ -858,8 +861,6 @@ void RenderCanvas::keyPressEvent(QKeyEvent* e) {
                     inject_cursor_pos_++;
                 }
             }
-            // Parse layer count
-            try { inject_layer_count_ = std::stoi(txt); } catch (...) {}
             return;
         }
 
@@ -944,6 +945,7 @@ void RenderCanvas::transition_to_config() {
 }
 
 void RenderCanvas::transition_to_running() {
+    if (!validate_config()) return;
     apply_config_params();
     opt_state_ = OptState::Running;
     opt_running_ = true;
@@ -1009,26 +1011,18 @@ void RenderCanvas::transition_to_idle() {
 }
 
 void RenderCanvas::apply_config_params() {
-    try { opt_res_w_ = std::stoi(input_texts_[0]); } catch (...) {}
-    try { opt_res_h_ = std::stoi(input_texts_[1]); } catch (...) {}
-    try { num_cycles_ = std::stoi(input_texts_[2]); } catch (...) {}
-    try { num_shapes_ = std::stoi(input_texts_[3]); } catch (...) {}
-    try { lr_start_ = std::stof(input_texts_[4]); } catch (...) {}
-    try { lr_end_ = std::stof(input_texts_[5]); } catch (...) {}
+    const auto config = gui::parse_optimization_inputs(input_texts_);
+    if (!config) return;
+    opt_res_w_ = config->canvas_w;
+    opt_res_h_ = config->canvas_h;
+    num_cycles_ = config->num_cycles;
+    num_shapes_ = config->num_shapes;
+    lr_start_ = config->lr_start;
+    lr_end_ = config->lr_end;
 }
 
 bool RenderCanvas::validate_config() {
-    try {
-        int w = std::stoi(input_texts_[0]);
-        int h = std::stoi(input_texts_[1]);
-        int c = std::stoi(input_texts_[2]);
-        int n = std::stoi(input_texts_[3]);
-        float ls = std::stof(input_texts_[4]);
-        float le = std::stof(input_texts_[5]);
-        return w > 0 && h > 0 && c > 0 && n > 0 && ls > 0 && le > 0 && le <= ls;
-    } catch (...) {
-        return false;
-    }
+    return gui::parse_optimization_inputs(input_texts_).has_value();
 }
 
 // ── Optimization ────────────────────────────────────────────
@@ -1120,6 +1114,8 @@ void RenderCanvas::on_inject_preview_ready() {
 
 void RenderCanvas::start_inject() {
     if (inject_json_path_.empty() || inject_running_) return;
+    const auto layer_count = gui::parse_inject_layer_count(inject_layer_text_);
+    if (!layer_count) return;
 
     inject_running_ = true;
     inject_logs_.clear();
@@ -1127,7 +1123,7 @@ void RenderCanvas::start_inject() {
 
     InjectConfig cfg;
     cfg.json_path = inject_json_path_;
-    cfg.layer_count = inject_layer_count_;
+    cfg.layer_count = *layer_count;
     cfg.process_id = 0; // auto-detect
 
     inject_worker_ = new InjectWorker(cfg, this);
@@ -1176,68 +1172,7 @@ void RenderCanvas::on_inject_finished(bool success) {
 }
 
 QImage RenderCanvas::render_json_preview(const std::string& json_path) {
-    // Use Canvas to render a quick preview
-    try {
-        auto shapes = validate_json(json_path);
-        if (shapes.empty()) return QImage();
-
-        // Compute bounding box from all shapes
-        double min_x = std::numeric_limits<double>::infinity(), min_y = min_x;
-        double max_x = -min_x, max_y = -min_x;
-        for (auto& s : shapes) {
-            auto& d = s["data"];
-            double cx = d[0], cy = d[1], rx = d[2], ry = d[3];
-            if (s["type"] == 1) { rx *= 0.5; ry *= 0.5; }
-            double angle = d.size() >= 5 ? d[4].get<double>() : 0;
-            double cos_a = std::cos(std::fmod(angle, 360.0) * M_PI / 180.0);
-            double sin_a = std::sin(std::fmod(angle, 360.0) * M_PI / 180.0);
-            double hx = std::abs(rx * cos_a) + std::abs(ry * sin_a);
-            double hy = std::abs(rx * sin_a) + std::abs(ry * cos_a);
-            min_x = std::min(min_x, cx - hx);
-            min_y = std::min(min_y, cy - hy);
-            max_x = std::max(max_x, cx + hx);
-            max_y = std::max(max_y, cy + hy);
-        }
-        int pad = 4;
-        // Bound preview allocation before converting JSON coordinates to integer dimensions.
-        double extent = std::max(max_x - min_x, max_y - min_y) + pad * 2;
-        if (!std::isfinite(extent) || extent <= 0) return QImage();
-        double preview_scale = std::min(1.0, 2048.0 / extent);
-        int cw = std::max(1, static_cast<int>(std::ceil((max_x - min_x + pad * 2) * preview_scale)));
-        int ch = std::max(1, static_cast<int>(std::ceil((max_y - min_y + pad * 2) * preview_scale)));
-        double ox = min_x - pad;
-        double oy = min_y - pad;
-
-        Canvas canvas(cw, ch);
-        std::vector<Shape> shape_vec;
-        for (auto& s : shapes) {
-            int type = s["type"];
-            auto& data = s["data"];
-            auto& color = s["color"];
-            Color c(static_cast<uint8_t>(color[0].get<int>()),
-                    static_cast<uint8_t>(color[1].get<int>()),
-                    static_cast<uint8_t>(color[2].get<int>()),
-                    static_cast<uint8_t>(color[3].get<int>()));
-
-            Shape shape;
-            shape.type = type;
-            shape.cx = static_cast<float>((data[0].get<double>() - ox) * preview_scale);
-            shape.cy = static_cast<float>((data[1].get<double>() - oy) * preview_scale);
-            shape.rx = static_cast<float>(data[2].get<double>() * preview_scale);
-            shape.ry = static_cast<float>(data[3].get<double>() * preview_scale);
-            shape.angle = data.size() >= 5 ? static_cast<float>(std::fmod(data[4].get<double>(), 360.0)) : 0;
-            shape.color = c;
-            shape.opacity = c.a / 255.0f;
-            shape_vec.push_back(shape);
-        }
-        canvas.add_shapes(shape_vec);
-
-        cv::Mat bgr = canvas.clone_image();
-        QImage img(bgr.data, bgr.cols, bgr.rows, bgr.step, QImage::Format_RGB888);
-        return img.copy();
-    } catch (...) {
-        return QImage();
-    }
+    return render_json_preview_file(json_path);
 }
 
 } // namespace vinylizer

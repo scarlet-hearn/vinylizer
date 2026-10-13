@@ -119,7 +119,6 @@ private:
     Transition inject_page_trans_;
     std::string inject_json_path_;
     std::string inject_json_filename_;
-    int inject_layer_count_ = 2000;
     QImage inject_preview_;
     bool inject_preview_loaded_ = false;
     bool inject_preview_loading_ = false;
